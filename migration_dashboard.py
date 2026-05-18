@@ -526,8 +526,13 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
 
     src_ip = HOSTS_CONFIG[src_host]["ip"]
     dst_ip = HOSTS_CONFIG[dst_host]["ip"]
-    dst_fqdn = HOSTS_CONFIG[dst_host]["fqdn"]
-    mig_uri = f"tcp://{dst_ip}:0"
+    dest_uri = f"qemu+ssh://root@{dst_ip}/system"
+    mig_tcp = f"tcp://{dst_ip}:0"
+    mig_qemu = f"qemu+tcp://{dst_ip}/system"
+    virsh_base = [
+        "virsh", "-c", f"qemu+ssh://root@{src_ip}/system",
+        "migrate", "--live", "--persistent", "--undefinesource", "--unsafe",
+    ]
 
     with _lock:
         active_mig    = MigrationJob(vm_name=vm_name,
@@ -537,20 +542,19 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
 
     log("MIG", f"{vm_name}: {src_host} → {dst_host} migration started")
 
-    # --unsafe: NFS shared disk; --migrateuri: data channel to cluster IP (fixes C-only I/O errors)
-    base_cmd = [
-        "virsh", "-c", f"qemu+ssh://root@{src_ip}/system",
-        "migrate", "--live", "--persistent", "--undefinesource", "--unsafe",
-        "--migrateuri", mig_uri,
-        vm_name, f"qemu+ssh://root@{dst_fqdn}/system",
+    attempts = [
+        virsh_base + ["--migrateuri", mig_tcp, vm_name, dest_uri],
+        virsh_base + ["--migrateuri", mig_qemu, vm_name, dest_uri],
+        virsh_base + ["--migrateuri", mig_tcp, "--p2p", vm_name, dest_uri],
+        virsh_base + ["--tunnelled", "--p2p", vm_name, dest_uri],
     ]
-    result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        log("MIG", f"{vm_name}: retry with --tunnelled")
-        result = subprocess.run(
-            base_cmd[:-2] + ["--tunnelled", vm_name, base_cmd[-1]],
-            capture_output=True, text=True, timeout=600,
-        )
+    result = None
+    for i, cmd in enumerate(attempts):
+        if i > 0:
+            log("MIG", f"{vm_name}: retry ({i + 1}/{len(attempts)})")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0:
+            break
 
     with _lock:
         mig = active_mig

@@ -207,8 +207,14 @@ sudo systemctl restart libvirtd
 # Host-A에서 점검
 ssh root@serverc 'mount | grep libvirt; hostname -f; virsh version'
 virsh migrate --live --unsafe --migrateuri tcp://<C_IP>:0 \
-  vm-5 qemu+ssh://root@serverc.hw6.local/system
+  vm-5 qemu+ssh://root@<C_IP>/system
+
+# I/O 후 tunnelled만 쓰면 실패 → 반드시 --p2p 와 함께
+virsh migrate --live --unsafe --tunnelled --p2p \
+  vm-5 qemu+ssh://root@<C_IP>/system
 ```
+
+`cannot perform tunnelled migration without using peer2peer flag` → 스크립트가 `--tunnelled --p2p` 로 재시도함 (`git pull` 후 재실행).
 
 ---
 
