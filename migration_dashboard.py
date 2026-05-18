@@ -408,37 +408,44 @@ def _update_loop():
     global active_mig  # noqa: PLW0603
     while running:
         try:
-            for h_name, h_conf in HOSTS_CONFIG.items():
-                ip = h_conf["ip"]
-                vms, ok = fetch_host_vms(h_name, ip)
-                cpu_h, mem_h, mu, mt = (0.0, 0.0, 0, 0)
-                if ok:
-                    cpu_h, mem_h, mu, mt = fetch_host_utilization(ip)
-
-                with _lock:
-                    if h_name in hosts:
-                        hosts[h_name].vms = vms
-                        hosts[h_name].reachable = ok
-                        if ok:
-                            hosts[h_name].cpu_host_pct = cpu_h
-                            hosts[h_name].mem_host_pct = mem_h
-                            hosts[h_name].mem_used_mb  = mu
-                            hosts[h_name].mem_total_mb = mt
-
             with _lock:
                 mig = active_mig
+                mig_active = mig is not None and not mig.completed and not mig.failed
 
-            if mig and not mig.completed and not mig.failed:
+            if mig_active:
+                # ── MIGRATION IN PROGRESS ────────────────────────────────────
+                # Skip the expensive full host poll (3× virsh list + dominfo +
+                # ssh_script per host) that hammers SSH during migration.
+                # Only fetch domjobinfo to drive the LIVE MIGRATION panel.
+                assert mig is not None
                 src_ip = HOSTS_CONFIG[mig.src_host]["ip"]
                 job = fetch_domjobinfo(src_ip, mig.vm_name)
                 with _lock:
                     if job and active_mig:
                         _apply_domjob_to_mig(active_mig, job)
                     elif active_mig and not active_mig.completed:
-                        if _finalize_migration(active_mig, src_ip):
-                            with _lock:
-                                mig_history.append(active_mig)
-                                active_mig = None
+                        # No active job on source: migration may have completed;
+                        # _do_migrate thread will finalize when subprocess returns.
+                        pass
+            else:
+                # ── NORMAL POLLING ───────────────────────────────────────────
+                for h_name, h_conf in HOSTS_CONFIG.items():
+                    ip = h_conf["ip"]
+                    vms, ok = fetch_host_vms(h_name, ip)
+                    cpu_h, mem_h, mu, mt = (0.0, 0.0, 0, 0)
+                    if ok:
+                        cpu_h, mem_h, mu, mt = fetch_host_utilization(ip)
+
+                    with _lock:
+                        if h_name in hosts:
+                            hosts[h_name].vms = vms
+                            hosts[h_name].reachable = ok
+                            if ok:
+                                hosts[h_name].cpu_host_pct = cpu_h
+                                hosts[h_name].mem_host_pct = mem_h
+                                hosts[h_name].mem_used_mb  = mu
+                                hosts[h_name].mem_total_mb = mt
+
         except Exception:  # noqa: BLE001
             pass  # update loop must never crash; next tick will retry
 
@@ -582,14 +589,18 @@ def run_load_balance():
 def _do_migrate(vm_name: str, src_host: str, dst_host: str):
     """Live-migrate vm_name from src_host to dst_host.
 
-    Strategy mirrors hw6_virsh_migrate_live in hw6_config.sh:
-    - If src is Host-A: run  virsh migrate  locally (no remote SSH wrapper).
-    - If src is Host-B/C: SSH into src and run  virsh migrate  there.
-    Either way the migration data channel uses  --migrateuri tcp://<dst_ip>:0
-    (plain TCP, NOT tunnelled), so the SSH session that drives the dashboard
-    is never flooded with VM memory traffic and will not disconnect.
-    --tunnelled --p2p is NOT attempted; it routes GB of RAM through the SSH
-    connection and reliably kills the Xshell session.
+    Always runs virsh on Host-A (the controller):
+    - src = Host-A → local virsh (no -c, connects to local libvirtd)
+    - src = Host-B/C → virsh -c qemu+ssh://src_fqdn/system  (libvirt manages
+      its own SSH connection to the source; data still goes via TCP directly)
+
+    stdin=DEVNULL is critical: the dashboard puts the TTY in raw mode via
+    tty.setraw().  Without DEVNULL, child processes inherit that raw-mode TTY
+    as stdin, which causes SSH to attempt terminal negotiation and drop the
+    session immediately.
+
+    --tunnelled --p2p is never used: it routes GB of VM RAM through the
+    qemu+ssh control channel and reliably kills the Xshell session.
     """
     global active_mig, _mig_start_time
 
@@ -601,7 +612,6 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
     dest_uri = f"qemu+ssh://root@{dst_fqdn}/system"
     mig_tcp  = f"tcp://{dst_ip}:0"
 
-    # virsh flags — must match hw6_virsh_migrate_live
     mig_flags = [
         "--live", "--persistent", "--undefinesource", "--unsafe",
         "--migrateuri", mig_tcp,
@@ -615,23 +625,18 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
 
     log("MIG", f"{vm_name}: {src_host} -> {dst_host} migration started")
 
-    src_short = HOSTS_CONFIG[src_host].get("short", "")
+    src_short    = HOSTS_CONFIG[src_host].get("short", "")
     is_local_src = (src_short == "servera")
 
     if is_local_src:
-        # Host-A is the source: run virsh locally — no remote SSH wrapping.
+        # Host-A is source: run local virsh (connects to local libvirtd)
         cmd = ["virsh", "migrate"] + mig_flags + [vm_name, dest_uri]
     else:
-        # Host-B or C is the source: SSH there and run virsh locally.
-        # Using  ssh ... virsh migrate  (not virsh -c qemu+ssh://...) so that
-        # the migration data stream goes directly B->C (or C->B) via TCP,
-        # without touching this Python process at all.
-        remote_cmd = (
-            f"virsh migrate --live --persistent --undefinesource --unsafe "
-            f"--migrateuri 'tcp://{dst_ip}:0' "
-            f"'{vm_name}' '{dest_uri}'"
-        )
-        cmd = ["ssh"] + _SSH_OPTS + [f"root@{src_fqdn}", remote_cmd]
+        # Host-B/C is source: use virsh -c to reach source libvirtd from Host-A.
+        # libvirt manages its own internal SSH connection (A→src);
+        # migration data flows src→dst via TCP (--migrateuri), not via SSH.
+        src_uri = f"qemu+ssh://root@{src_fqdn}/system"
+        cmd = ["virsh", "-c", src_uri, "migrate"] + mig_flags + [vm_name, dest_uri]
 
     result = subprocess.run(
         cmd, stdin=subprocess.DEVNULL,
@@ -652,12 +657,19 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
                     mig_history.append(active_mig)
                     active_mig = None
     else:
+        err_detail = (result.stderr or result.stdout or "").strip()
+        # Log first meaningful non-empty line so the user can diagnose
+        for _ln in err_detail.splitlines():
+            _ln = _ln.strip()
+            if _ln:
+                log("ERR", f"{vm_name} virsh: {_ln[:120]}")
+                break
         with _lock:
             if active_mig:
                 active_mig.failed = True
-                active_mig.error_msg = result.stderr.strip()[:80]
+                active_mig.error_msg = err_detail[:80]
                 active_mig.elapsed = time.time() - _mig_start_time
-                log("ERR", f"{vm_name} failed: {active_mig.error_msg}")
+                log("ERR", f"{vm_name} failed (rc={result.returncode}) — check LOG above")
                 mig_history.append(active_mig)
                 active_mig = None
 
