@@ -239,9 +239,9 @@ sudo bash hw6_diag_migration.sh    # Host-A에서 실행
 
 ```bash
 cd ~/ACC-HW6 && git pull
-sudo bash hw6_fix_vm_cpu.sh          # 기존 vm-1..6 CPU → qemu64
-# 또는 VM 다시 만들기
-sudo bash create_vms.sh
+`create_vms.sh` 는 처음부터 `--cpu qemu64,-svm` 으로 만듦 (STEP 3에서 CPU 일괄 수정 **없음** — 멈춤 원인 제거).
+
+이전에 만든 VM만: `sudo bash hw6_fix_vm_cpu.sh`
 ```
 
 새 VM은 `--cpu qemu64,-svm --machine q35` 로 생성됩니다 (Intel 전용).

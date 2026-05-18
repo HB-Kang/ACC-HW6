@@ -30,6 +30,17 @@ hw6_vm_cpu_spec() {
     [[ -n "${HW6_VM_CPU_FLAGS}" ]] && spec="${spec},${HW6_VM_CPU_FLAGS}"
     echo "$spec"
 }
+
+# True if domain XML already matches lab CPU (skip slow virt-xml / SSH loops)
+hw6_vm_cpu_ok() {
+    local vm="$1"
+    local xml
+
+    xml="$(virsh dumpxml "$vm" 2>/dev/null)" || return 1
+    echo "$xml" | grep -qE "<model[^>]*>(qemu64|Penryn)</model>" || return 1
+    echo "$xml" | grep -qE "name='svm'[^>]*policy='require'" && return 1
+    return 0
+}
 HW6_HOSTS_MARK_BEGIN="# BEGIN HW6 CLUSTER"
 HW6_HOSTS_MARK_END="# END HW6 CLUSTER"
 HW6_CLUSTER_HOSTS=(servera serverb serverc)
@@ -573,7 +584,7 @@ hw6_ssh_set_cpu_migratable() {
     spec="$(hw6_vm_cpu_spec)"
 
     hw6_ssh_test_host "$host" || return 1
-    ssh -o BatchMode=yes "root@${host}" bash -s -- "$vm" "$spec" <<'EOS'
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${host}" bash -s -- "$vm" "$spec" <<'EOS'
 vm="$1"
 model="$2"
 virsh dominfo "$vm" &>/dev/null || exit 0
@@ -585,20 +596,26 @@ virt-xml "$vm" --edit --cpu "$model" --confirm
 EOS
 }
 
-# Set migratable CPU on whichever host currently defines the VM
+# Fix CPU on one host (hw6_fix_vm_cpu.sh only — not used during create_vms)
 hw6_ensure_vm_cpu_migratable() {
     local vm="$1"
     local h
 
     if virsh dominfo "$vm" &>/dev/null; then
+        hw6_vm_cpu_ok "$vm" && return 0
         hw6_virsh_set_cpu_migratable "$vm"
         return $?
     fi
     for h in serverb serverc; do
-        if hw6_ssh_test_host "$h" && ssh -o BatchMode=yes "root@${h}" "virsh dominfo '${vm}'" &>/dev/null; then
-            hw6_ssh_set_cpu_migratable "$h" "$vm" && ok_cb "${vm}: CPU fixed on ${h}"
+        hw6_ssh_test_host "$h" || continue
+        ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${h}" "virsh dominfo '${vm}'" &>/dev/null || continue
+        if ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${h}" "virsh dumpxml '${vm}'" 2>/dev/null \
+            | grep -qE '<model[^>]*>(qemu64|Penryn)</model>'; then
+            ok_cb "${vm}: CPU OK on ${h}"
             return 0
         fi
+        hw6_ssh_set_cpu_migratable "$h" "$vm" && ok_cb "${vm}: CPU fixed on ${h}"
+        return $?
     done
     warn_cb "${vm}: not defined on servera/b/c"
     return 1
@@ -607,7 +624,7 @@ hw6_ensure_vm_cpu_migratable() {
 hw6_ensure_all_vms_cpu_migratable() {
     local vm
     for vm in vm-1 vm-2 vm-3 vm-4 vm-5 vm-6; do
-        hw6_ensure_vm_cpu_migratable "$vm" 2>/dev/null || true
+        hw6_ensure_vm_cpu_migratable "$vm" || true
     done
 }
 
@@ -629,7 +646,11 @@ hw6_virsh_migrate_live() {
 
     hw6_remote_repair_migration_target "$dest_short" || return 1
     hw6_migration_clear_dest_domain "$vm_name" "$dest_short"
-    hw6_ensure_vm_cpu_migratable "$vm_name" || warn_cb "${vm_name}: CPU may still be host-model — migration can fail on C"
+
+    if virsh dominfo "$vm_name" &>/dev/null && ! hw6_vm_cpu_ok "$vm_name"; then
+        warn_cb "${vm_name}: CPU not $(hw6_vm_cpu_spec) — run: sudo bash hw6_fix_vm_cpu.sh (or recreate with create_vms.sh)"
+        return 1
+    fi
 
     if ! virsh -c "$dest_uri" version &>/dev/null; then
         warn_cb "Cannot connect to ${dest_uri} — check SSH and libvirtd on ${dest_short}"

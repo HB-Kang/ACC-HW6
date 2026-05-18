@@ -118,6 +118,7 @@ METADATA
 
 # ── [3] Create VMs ────────────────────────────────────────────────────────────
 echo -e "\n${CYAN}${BOLD}[STEP 2]${NC} Create VMs"
+info "CPU at install: $(hw6_vm_cpu_spec) on machine ${HW6_VM_MACHINE} (migratable A/B/C — no post-edit)"
 info "cloud-init ISOs: ${CLOUD_INIT_DIR} (local — not NFS, avoids lock conflicts)"
 info "Removing old VM definitions on A/B/C before recreate..."
 for vm in "${VM_NAMES[@]}"; do
@@ -162,7 +163,7 @@ for vm in "${VM_NAMES[@]}"; do
         --quiet
 
     hw6_vm_detach_cloud_init_cdrom "$vm" 2>/dev/null || true
-    ok "$vm created (cloud-init CDROM detached from domain XML)"
+    ok "$vm created (CPU $(hw6_vm_cpu_spec))"
 done
 
 # ── [4] Initial placement (migrate to B, C) ───────────────────────────────────
@@ -181,9 +182,6 @@ else
 fi
 
 if [[ "$do_place" -eq 1 ]]; then
-    info "Setting migratable CPU ($(hw6_vm_cpu_spec)) on all VMs before live migration..."
-    hw6_ensure_all_vms_cpu_migratable
-
     hw6_check_nfs_shared_storage "$IMAGES_DIR" || \
         warn "NFS may not be mounted on this host — migration needs shared ${IMAGES_DIR}"
     hw6_migration_preflight serverb || warn "Host-B preflight failed — migration may fail"
