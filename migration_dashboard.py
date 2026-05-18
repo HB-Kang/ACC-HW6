@@ -69,7 +69,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
@@ -94,8 +93,8 @@ UI_REFRESH_SEC   = 1.0   # keyboard poll interval
 # SSH terminal 209×41 target — 2-column UI: hosts (left) | status+log (right)
 TERM_COLS = 209
 TERM_ROWS = 41
-TERM_MARGIN = 1   # avoid drawing in last column (wrap → +1 line → "floating")
-ROW_MARGIN = 1    # layout height = rows - ROW_MARGIN (never scroll alternate screen)
+TERM_MARGIN = 2   # last columns empty — column 209 wrap adds a ghost line (Xshell)
+ROW_MARGIN = 2    # never fill to physical bottom row
 LOG_MAX_LINES = 12
 VM_LINES_PER_HOST = 3
 HOST_BAR_WIDTH = 22
@@ -649,6 +648,30 @@ def _layout_sizes(term_rows: int) -> Dict[str, int]:
     }
 
 
+def _fit_line(s: str, width: int) -> str:
+    """One terminal row, no newline (plain chars only for width)."""
+    plain = re.sub(r"\033\[[0-9;]*m", "", s)
+    if len(plain) <= width:
+        return plain.ljust(width)
+    return plain[: max(0, width - 3)] + "..."
+
+
+def _present(layout: Layout, width: int, height: int) -> None:
+    """Paint exactly `height` rows — no Rich Live / alternate screen (no scroll bump)."""
+    with console.capture() as capture:
+        console.print(layout, width=width, height=height, overflow="crop")
+    lines = capture.get().splitlines()
+    lines = lines[:height]
+    while len(lines) < height:
+        lines.append("")
+    sys.stdout.write("\033[H\033[J")
+    for i, raw in enumerate(lines):
+        sys.stdout.write(_fit_line(raw, width))
+        if i < height - 1:
+            sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _footer_plain() -> str:
     parts = []
     for key, desc in (
@@ -673,8 +696,8 @@ def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> T
     fill  = int(pct / 100 * width)
     c     = "red" if pct >= 90 else ("yellow" if pct >= 70 else color)
     t = Text()
-    t.append("█" * fill,           style=f"bold {c}")
-    t.append("░" * (width - fill), style="dim")
+    t.append("#" * fill, style=f"bold {c}")
+    t.append("." * (width - fill), style="dim")
     return t
 
 
@@ -683,6 +706,7 @@ def _render_host_panel(
     *,
     bar_width: int = HOST_BAR_WIDTH,
     vm_max: int = VM_LINES_PER_HOST,
+    panel_height: Optional[int] = None,
 ) -> Panel:
     color = HOST_COLORS.get(hs.name, "white")
 
@@ -705,23 +729,23 @@ def _render_host_panel(
 
     if has_host:
         grid.add_row(
-            Text("CPU▲", style="bold white"),
+            Text("CPUh", style="bold white"),
             _make_bar(cpu_host, bar_width, color),
             Text(f"{cpu_host:.0f}% host", style=pct_style(cpu_host, color)),
         )
         grid.add_row(
-            Text("CPU◇", style="dim"),
+            Text("CPUa", style="dim"),
             _make_bar(cpu_alloc_pct, bar_width, "dim"),
             Text(f"{cpu_alloc_pct:.0f}% alloc", style="dim"),
         )
         mem_label = f"{hs.mem_used_mb}/{hs.mem_total_mb}M"
         grid.add_row(
-            Text("MEM▲", style="bold white"),
+            Text("MEMh", style="bold white"),
             _make_bar(mem_host, bar_width, color),
             Text(f"{mem_host:.0f}% {mem_label}", style=pct_style(mem_host, color)),
         )
         grid.add_row(
-            Text("MEM◇", style="dim"),
+            Text("MEMa", style="dim"),
             _make_bar(mem_alloc_pct, bar_width, "dim"),
             Text(f"{mem_alloc_pct:.0f}% alloc", style="dim"),
         )
@@ -778,15 +802,30 @@ def _render_host_panel(
             grid.add_row(Text(""), Text(f"+{extra} more", style="dim"), Text(""))
 
     border = "red" if not hs.reachable else color
-    return Panel(
-        grid,
+    kw: dict = dict(
         title=f"[bold {color}]{hs.name}[/] [dim]{hs.ip}[/dim]",
         border_style=border,
-        box=box.ROUNDED,
+        box=box.ASCII,
     )
+    if panel_height is not None:
+        kw["height"] = panel_height
+    return Panel(grid, **kw)
 
 
-def _render_status_panel() -> Panel:
+def _boxed(
+    renderable,
+    *,
+    title: str = "",
+    border_style: str = "dim",
+    panel_height: Optional[int] = None,
+) -> Panel:
+    kw: dict = dict(title=title, border_style=border_style, box=box.ASCII)
+    if panel_height is not None:
+        kw["height"] = panel_height
+    return Panel(renderable, **kw)
+
+
+def _render_status_panel(*, panel_height: Optional[int] = None) -> Panel:
     with _lock:
         mig  = active_mig
         plan = dict(bin_pack_plan)
@@ -801,8 +840,8 @@ def _render_status_panel() -> Panel:
         bar_w = min(48, _ui.get("width", TERM_COLS) // 2 - 28)
         fill  = int(pct / 100 * bar_w)
         bar   = Text()
-        bar.append("█" * fill,          style="bold blue")
-        bar.append("░" * (bar_w - fill), style="dim")
+        bar.append("#" * fill, style="bold blue")
+        bar.append("." * (bar_w - fill), style="dim")
         bar.append(f"  {pct:.0f}%",     style="bold cyan")
 
         arrow = "─" * 16
@@ -839,31 +878,32 @@ def _render_status_panel() -> Panel:
                 Text(f"{mig.downtime_ms} ms (live)", style="bold green"),
             )
 
-        return Panel(t, title="🚀 LIVE MIGRATION",
-                     border_style="blue", box=box.ROUNDED)
+        return _boxed(t, title="LIVE MIGRATION", border_style="blue",
+                      panel_height=panel_height)
 
     # ── Bin Packing plan ready ─────────────────────────────────────────────────
     if plan:
         with _lock:
             current = {v.name: v.host
                        for hs in hosts.values() for v in hs.vms}
-        moves = [f"{vm} {current.get(vm,'?')} → {tgt}"
+        moves = [f"{vm} {current.get(vm,'?')} -> {tgt}"
                  for vm, tgt in plan.items()
                  if current.get(vm) != tgt]
         if moves:
             t = Text()
-            t.append("✦ Bin Packing complete  ", style="bold yellow")
+            t.append("* Bin Packing complete  ", style="bold yellow")
             t.append(f"{len(moves)} VM(s) to relocate  ", style="white")
             t.append("press [m] to run", style="dim")
             line = "  |  ".join(moves[:3])
             if len(moves) > 3:
                 line += f"  |  +{len(moves) - 3} more"
             t.append("\n\n" + line[:90], style="cyan")
-            return Panel(t, title="PLAN", border_style="yellow", box=box.ROUNDED)
+            return _boxed(t, title="PLAN", border_style="yellow",
+                          panel_height=panel_height)
         else:
-            return Panel(
-                Text("✓ Current placement is already optimal.", style="green"),
-                title="PLAN", border_style="dim", box=box.ROUNDED
+            return _boxed(
+                Text("Current placement is already optimal.", style="green"),
+                title="PLAN", border_style="dim", panel_height=panel_height,
             )
 
     # ── Recent migration metrics ─────────────────────────────────────────────
@@ -877,7 +917,7 @@ def _render_status_panel() -> Panel:
         for j in reversed(recent):
             line = Text()
             line.append(f"{j.vm_name} ", style="bold")
-            line.append(f"{j.src_host}→{j.dst_host}  ", style="dim")
+            line.append(f"{j.src_host}->{j.dst_host}  ", style="dim")
             line.append(f"{j.elapsed:.1f}s", style="cyan")
             if j.downtime_ms is not None:
                 line.append(f"  downtime ", style="dim")
@@ -885,20 +925,14 @@ def _render_status_panel() -> Panel:
             elif j.failed:
                 line.append("  FAILED", style="bold red")
             hist.add_row(Text("Last mig", style="dim"), line)
-        return Panel(hist, title="MIGRATION STATS",
-                     border_style="dim green", box=box.ROUNDED)
+        return _boxed(hist, title="MIGRATION STATS", border_style="green",
+                      panel_height=panel_height)
 
-    # ── Idle ─────────────────────────────────────────────────────────────────
-    t = Text()
-    t.append("Idle — ", style="dim")
-    t.append("[r]", style="bold yellow"); t.append(" spread/defrag  ", style="dim")
-    t.append("[c]", style="bold yellow"); t.append(" Host-C Idle  ", style="dim")
-    t.append("[l]", style="bold yellow"); t.append(" load balance  ", style="dim")
-    t.append("[m]", style="bold yellow"); t.append(" run migration", style="dim")
-    return Panel(t, title="STATUS", border_style="dim", box=box.ROUNDED)
+    t = Text("Idle — use footer keys", style="dim")
+    return _boxed(t, title="STATUS", border_style="dim", panel_height=panel_height)
 
 
-def _render_log_panel() -> Panel:
+def _render_log_panel(*, panel_height: Optional[int] = None) -> Panel:
     LEVEL_STYLE = {
         "OK":  "bold green",
         "INF": "bold blue",
@@ -925,7 +959,7 @@ def _render_log_panel() -> Panel:
             Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
             Text(msg),
         )
-    return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
+    return _boxed(grid, title="LOG", border_style="dim", panel_height=panel_height)
 
 
 def _build_layout(sizes: Dict[str, int]) -> Layout:
@@ -952,29 +986,34 @@ def _build_layout(sizes: Dict[str, int]) -> Layout:
     return layout
 
 
-def _render(layout: Layout) -> None:
+def _render(layout: Layout, sizes: Dict[str, int]) -> None:
     layout["header"].update(Panel(
         Align.center(Text(
-            "HW6 Live Migration Dashboard  ·  2D Bin Packing",
+            "HW6 Live Migration Dashboard  -  2D Bin Packing",
             style="bold cyan",
         )),
         border_style="blue",
-        box=box.HEAVY_HEAD,
+        box=box.ASCII,
+        height=sizes["header"],
     ))
 
     with _lock:
         host_states = dict(hosts)
 
     narrow = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
+    ph = sizes["host_h"]
     layout["host_a"].update(_render_host_panel(
-        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False)), **narrow))
+        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False)),
+        panel_height=ph, **narrow))
     layout["host_b"].update(_render_host_panel(
-        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False)), **narrow))
+        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False)),
+        panel_height=ph, **narrow))
     layout["host_c"].update(_render_host_panel(
-        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False)), **narrow))
+        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False)),
+        panel_height=ph, **narrow))
 
-    layout["status"].update(_render_status_panel())
-    layout["log"].update(_render_log_panel())
+    layout["status"].update(_render_status_panel(panel_height=sizes["status_h"]))
+    layout["log"].update(_render_log_panel(panel_height=sizes["log_h"]))
 
     # Single-line footer (no Panel border — extra lines caused scroll "float")
     layout["footer"].update(
@@ -1105,35 +1144,26 @@ def main():
     upd.start()
 
     layout = _build_layout(sizes)
+    draw_h = sizes["total"]
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        live_kw = dict(
-            console=console,
-            screen=True,
-            transient=True,
-            auto_refresh=False,
-            refresh_per_second=1,
-            vertical_overflow="crop",
-        )
-        try:
-            live_ctx = Live(layout, **live_kw)
-        except TypeError:
-            live_kw.pop("vertical_overflow", None)
-            live_ctx = Live(layout, **live_kw)
-        with live_ctx as live:
-            while running:
-                _render(layout)
-                live.refresh()
-                if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
-                    key = sys.stdin.read(1)
-                    if key in ("q", "\x03"):
-                        running = False
-                        break
-                    _handle_key(key)
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+        while running:
+            _render(layout, sizes)
+            _present(layout, safe_w, draw_h)
+            if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
+                key = sys.stdin.read(1)
+                if key in ("q", "\x03"):
+                    running = False
+                    break
+                _handle_key(key)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        console.print("\n[dim]Dashboard exited.[/dim]")
+        sys.stdout.write("\033[?25h\033[H\033[J")
+        sys.stdout.flush()
+        console.print("[dim]Dashboard exited.[/dim]")
 
 
 if __name__ == "__main__":
