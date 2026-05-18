@@ -749,6 +749,8 @@ Host servera serverb serverc servera.${HW6_HOST_DOMAIN} serverb.${HW6_HOST_DOMAI
     StrictHostKeyChecking accept-new
     UserKnownHostsFile ${HW6_SSH_KNOWN_HOSTS}
     GlobalKnownHostsFile /dev/null
+    ServerAliveInterval 10
+    ServerAliveCountMax 6
 EOF
     chmod 644 "$dropin"
 }
