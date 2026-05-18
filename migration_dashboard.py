@@ -196,13 +196,17 @@ def _virsh(host_ip: str, *args, timeout: int = 10) -> str:
     """Run virsh on host_ip.
     Host-A: local virsh (no SSH).
     Host-B/C: ssh ControlMaster + remote virsh (one TCP conn per host).
+    stdin=DEVNULL: prevent raw-mode TTY leaking into child process.
     """
     if _is_local(host_ip):
         cmd = ["virsh"] + list(args)
     else:
         cmd = ["ssh"] + _SSH_OPTS + [f"root@{host_ip}", "virsh"] + list(args)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=timeout,
+        )
         return r.stdout if r.returncode == 0 else ""
     except Exception:
         return ""
@@ -276,14 +280,17 @@ def _parse_ms_field(s: str) -> Optional[int]:
 
 
 def _ssh_script(host_ip: str, script: str, timeout: int = 10) -> str:
-    """Run a bash script on the host via SSH (ControlMaster reuse)."""
+    """Run a bash script on the host via SSH (ControlMaster reuse).
+    input= sets up its own stdin pipe; capture_output= covers stdout/stderr.
+    """
     if _is_local(host_ip):
         cmd = ["bash", "-s"]
     else:
         cmd = ["ssh"] + _SSH_OPTS + [f"root@{host_ip}", "bash", "-s"]
     try:
         r = subprocess.run(
-            cmd, input=script, capture_output=True, text=True, timeout=timeout
+            cmd, input=script,
+            capture_output=True, text=True, timeout=timeout,
         )
         return r.stdout if r.returncode == 0 else ""
     except Exception:
@@ -400,37 +407,40 @@ def _finalize_migration(mig: MigrationJob, src_ip: str) -> bool:
 def _update_loop():
     global active_mig  # noqa: PLW0603
     while running:
-        for h_name, h_conf in HOSTS_CONFIG.items():
-            ip = h_conf["ip"]
-            vms, ok = fetch_host_vms(h_name, ip)
-            cpu_h, mem_h, mu, mt = (0.0, 0.0, 0, 0)
-            if ok:
-                cpu_h, mem_h, mu, mt = fetch_host_utilization(ip)
+        try:
+            for h_name, h_conf in HOSTS_CONFIG.items():
+                ip = h_conf["ip"]
+                vms, ok = fetch_host_vms(h_name, ip)
+                cpu_h, mem_h, mu, mt = (0.0, 0.0, 0, 0)
+                if ok:
+                    cpu_h, mem_h, mu, mt = fetch_host_utilization(ip)
+
+                with _lock:
+                    if h_name in hosts:
+                        hosts[h_name].vms = vms
+                        hosts[h_name].reachable = ok
+                        if ok:
+                            hosts[h_name].cpu_host_pct = cpu_h
+                            hosts[h_name].mem_host_pct = mem_h
+                            hosts[h_name].mem_used_mb  = mu
+                            hosts[h_name].mem_total_mb = mt
 
             with _lock:
-                if h_name in hosts:
-                    hosts[h_name].vms = vms
-                    hosts[h_name].reachable = ok
-                    if ok:
-                        hosts[h_name].cpu_host_pct = cpu_h
-                        hosts[h_name].mem_host_pct = mem_h
-                        hosts[h_name].mem_used_mb  = mu
-                        hosts[h_name].mem_total_mb = mt
+                mig = active_mig
 
-        with _lock:
-            mig = active_mig
-
-        if mig and not mig.completed and not mig.failed:
-            src_ip = HOSTS_CONFIG[mig.src_host]["ip"]
-            job = fetch_domjobinfo(src_ip, mig.vm_name)
-            with _lock:
-                if job and active_mig:
-                    _apply_domjob_to_mig(active_mig, job)
-                elif active_mig and not active_mig.completed:
-                    if _finalize_migration(active_mig, src_ip):
-                        with _lock:
-                            mig_history.append(active_mig)
-                            active_mig = None
+            if mig and not mig.completed and not mig.failed:
+                src_ip = HOSTS_CONFIG[mig.src_host]["ip"]
+                job = fetch_domjobinfo(src_ip, mig.vm_name)
+                with _lock:
+                    if job and active_mig:
+                        _apply_domjob_to_mig(active_mig, job)
+                    elif active_mig and not active_mig.completed:
+                        if _finalize_migration(active_mig, src_ip):
+                            with _lock:
+                                mig_history.append(active_mig)
+                                active_mig = None
+        except Exception:  # noqa: BLE001
+            pass  # update loop must never crash; next tick will retry
 
         time.sleep(REFRESH_INTERVAL)
 
@@ -623,7 +633,10 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
         )
         cmd = ["ssh"] + _SSH_OPTS + [f"root@{src_fqdn}", remote_cmd]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(
+        cmd, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=600,
+    )
 
     with _lock:
         mig = active_mig
@@ -715,7 +728,9 @@ def run_preset(action: str) -> None:
         rc = -1
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
             )
             assert proc.stdout is not None
@@ -1343,14 +1358,24 @@ def main():
     layout = _build_layout(sizes)
     draw_h = sizes["total"]
     old_settings = termios.tcgetattr(sys.stdin)
+    _crash_log = Path("/tmp/hw6dash_crash.log")
     try:
         tty.setraw(sys.stdin.fileno())
         # ?25l: hide cursor | ?7l: disable auto-wrap | 2J: clear once | H: home
         sys.stdout.write("\033[?25l\033[?7l\033[2J\033[H")
         sys.stdout.flush()
         while running:
-            _render(layout, sizes)
-            _present(layout, safe_w, draw_h)
+            try:
+                _render(layout, sizes)
+                _present(layout, safe_w, draw_h)
+            except Exception as _exc:  # noqa: BLE001
+                # Never let a render exception kill the session; log and continue.
+                log("ERR", f"render: {_exc}")
+                try:
+                    import traceback as _tb
+                    _crash_log.write_text(_tb.format_exc())
+                except Exception:
+                    pass
             if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
                 key = sys.stdin.read(1)
                 if key in ("q", "\x03"):
