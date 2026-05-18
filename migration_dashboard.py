@@ -1073,7 +1073,7 @@ def _init_hosts():
 
 
 def main():
-    global running, HOSTS_CONFIG
+    global running, HOSTS_CONFIG, console, _ui
 
     try:
         HOSTS_CONFIG = load_hosts_config()
@@ -1083,7 +1083,6 @@ def main():
 
     _init_hosts()
 
-    global console, _ui
     tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
     safe_w = min(tw, TERM_COLS) - TERM_MARGIN
     sizes = _layout_sizes(th)
