@@ -1026,7 +1026,7 @@ def main():
     upd = threading.Thread(target=_update_loop, daemon=True)
     upd.start()
 
-  # Raw mode for single-key input; plain clear+print each second (SSH-safe)
+    # Raw mode for single-key input; plain clear+print each second (SSH-safe)
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
