@@ -261,6 +261,41 @@ hw6_install_openssh() {
     ok_cb "sshd enabled"
 }
 
+# cloud-init ISO: Rocky 9/10 often has xorriso, not genisoimage / bridge-utils
+hw6_install_iso_creator() {
+    if command -v xorriso &>/dev/null || command -v genisoimage &>/dev/null; then
+        return 0
+    fi
+    if dnf install -y -q xorriso &>/dev/null; then
+        ok_cb "xorriso installed (cloud-init ISO)"
+        return 0
+    fi
+    if dnf install -y -q genisoimage &>/dev/null; then
+        ok_cb "genisoimage installed (cloud-init ISO)"
+        return 0
+    fi
+    warn_cb "Install ISO tool manually: dnf install -y xorriso"
+    return 1
+}
+
+hw6_make_cidata_iso() {
+    local iso_path="$1"
+    local user_data_file="$2"
+    local meta_data_file="$3"
+
+    if command -v genisoimage &>/dev/null; then
+        genisoimage -quiet -output "$iso_path" -volid cidata -joliet -rock \
+            "$user_data_file" "$meta_data_file"
+        return $?
+    fi
+    if command -v xorriso &>/dev/null; then
+        xorriso -as mkisofs -quiet -output "$iso_path" -volid cidata -joliet -rock \
+            "$user_data_file" "$meta_data_file"
+        return $?
+    fi
+    return 1
+}
+
 hw6_sshd_lab_config() {
     local dropin="/etc/ssh/sshd_config.d/99-hw6-lab.conf"
     cat > "$dropin" << 'EOF'

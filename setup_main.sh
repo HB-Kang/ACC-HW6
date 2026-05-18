@@ -61,12 +61,11 @@ dnf install -y -q \
     libvirt-daemon-driver-qemu \
     libvirt-client \
     virt-install \
-    bridge-utils \
     guestfs-tools \
     wget \
-    python3-pip \
-    genisoimage
+    python3-pip
 ok "KVM packages installed"
+hw6_install_iso_creator || warn "xorriso missing — needed for create_vms.sh (dnf install -y xorriso)"
 
 # ── [4] NFS server ────────────────────────────────────────────────────────────
 step 4 "Install NFS server"

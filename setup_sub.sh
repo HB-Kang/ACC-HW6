@@ -81,7 +81,6 @@ dnf install -y -q \
     libvirt-daemon-driver-qemu \
     libvirt-client \
     virt-install \
-    bridge-utils \
     wget \
     python3-pip
 ok "KVM packages installed"

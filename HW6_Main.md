@@ -136,7 +136,37 @@ VM 콘솔: `virsh console vm-1` (종료 `Ctrl+]`) · root 비밀번호 `hw6pass`
 
 ---
 
-## 4. 실험 — `migration_dashboard.py` (A만)
+## 4. 실험 컨셉 (과제·시연)
+
+### 가정 용량 (Bin Packing 기준)
+
+호스트 **3대 각각** 아래 상자 크기로 취급합니다 (`cluster.conf` 기본값).
+
+| 항목 | 가정 |
+|------|------|
+| CPU | **8 vCPU** (VM에 할당한 vCPU 합) |
+| MEM | **16 GB** |
+| VM | 6대 (create_vms.sh 스펙) |
+
+- **물리 PC**가 코어·RAM이 더 많아도 괜찮습니다. 알고리즘·대시보드 **◇ alloc** %는 이 **8/16** 기준입니다.
+- **▲ host** %는 물리 머신 실제 사용률(참고용)입니다.
+- VM vCPU 합이 물리 코어 수보다 많아도 KVM에서는 보통 문제 없습니다(오버커밋).
+
+### Case 1~3 = Before / After 시연
+
+| Case | 키 | 목표 (개념) |
+|------|-----|-------------|
+| **1** Consolidation | `c` → `m` | Host-C **IDLE**, VM은 A·B로 |
+| **2** Defragmentation | `r` → `m` | CPU/MEM **쏠림 해소**, 3호스트 고르게 |
+| **3** Load balancing | `l` → `m` | 한 호스트 **과부하(80%+)** 완화 |
+
+**실제로 호스트가 과부하일 필요는 없습니다.**  
+제출·시연은 **대시보드 Before → `c`/`r`/`l` 계획 → `m` Migration → After** 흐름과 스크린샷이면 충분합니다.  
+Case 3 “과부하”도 **시나리오 이름**에 가깝고, 숫자를 맞추고 싶을 때만 stress-ng를 쓰면 됩니다.
+
+---
+
+## 5. 실험 — `migration_dashboard.py` (A만)
 
 ```bash
 python3 migration_dashboard.py
@@ -154,24 +184,20 @@ python3 migration_dashboard.py
 
 ### 시연 순서 (A)
 
-1. Before 스크린샷 (대시보드 3호스트 패널)  
-2. 필요 시 VM 부하 (`virsh console` 후 stress-ng)  
-3. `c` / `r` / `l` → 재배치 **계획** 캡처  
-4. `m` → 진행률·Dirty rate 캡처  
-5. After + downtime 기록  
+1. **Before** 스크린샷 (3호스트, ◇ alloc 위주)  
+2. `c` / `r` / `l` → STATUS **재배치 계획** 캡처  
+3. `m` → Migration 진행·Dirty rate 캡처  
+4. **After** 스크린샷 + `domjobinfo` Downtime  
 
-### stress-ng (VM 안)
+### stress-ng (선택 — 숫자 연출용)
+
+부하 없이 Migration만 돌려도 됩니다. Case 2/3 Before를 연출하고 싶을 때만:
 
 ```bash
+virsh console vm-1    # Ctrl+]
 stress-ng --cpu $(nproc) --timeout 0 &
 stress-ng --vm 1 --vm-bytes 80% --timeout 0 &
 ```
-
-| Case | 부하 팁 |
-|------|---------|
-| Case 1 | 초기 배치 유지 |
-| Case 2 | vm-1,2,3 CPU / vm-4,5,6 MEM |
-| Case 3 | A 위 VM CPU 풀가동 → A 90%+ 후 `l` |
 
 ### Downtime 기록 (A)
 
@@ -188,7 +214,7 @@ virsh migrate --live --persistent --undefinesource \
 
 ---
 
-## 5. A 체크리스트
+## 6. A 체크리스트
 
 ### 설치
 
@@ -209,7 +235,7 @@ virsh migrate --live --persistent --undefinesource \
 
 ---
 
-## 6. A 트러블슈팅
+## 7. A 트러블슈팅
 
 | 증상 | 조치 |
 |------|------|

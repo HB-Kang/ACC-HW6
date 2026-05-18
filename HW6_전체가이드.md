@@ -63,7 +63,16 @@
 
 ---
 
-## 5. config / SSH (팀이 알면 좋은 것)
+## 5. 실험 컨셉 (짧게)
+
+- 호스트당 **가정 용량 8 vCPU / 16 GB** (`CPU_CAP` / `MEM_CAP_MB` in `cluster.conf`)
+- 물리 스펙이 더 커도 과제·Bin Packing은 이 가정으로 진행
+- Case 1~3은 **Before/After 시연** — 실제 과부하·stress-ng **필수 아님**
+- 상세: [HW6_Main.md §4](HW6_Main.md#4-실험-컨셉-과제시연)
+
+---
+
+## 6. config / SSH (팀이 알면 좋은 것)
 
 A의 `setup_main.sh`가 `/etc/hw6/cluster.conf`를 만들고 NFS에 복사합니다.
 
@@ -75,7 +84,7 @@ A의 `setup_main.sh`가 `/etc/hw6/cluster.conf`를 만들고 NFS에 복사합니
 
 ---
 
-## 6. VirtualBox (선택)
+## 7. VirtualBox (선택)
 
 1. Nested VT: `VBoxManage modifyvm "VM이름" --nested-hw-virt on`  
 2. 네트워크: **브리지**  
@@ -84,7 +93,7 @@ A의 `setup_main.sh`가 `/etc/hw6/cluster.conf`를 만들고 NFS에 복사합니
 
 ---
 
-## 7. 트러블슈팅 (요약)
+## 8. 트러블슈팅 (요약)
 
 | 증상 | 누가 보나 |
 |------|-----------|
@@ -95,7 +104,7 @@ A의 `setup_main.sh`가 `/etc/hw6/cluster.conf`를 만들고 NFS에 복사합니
 
 ---
 
-## 8. 문서 목록
+## 9. 문서 목록
 
 | 파일 | 대상 |
 |------|------|

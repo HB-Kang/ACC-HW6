@@ -103,11 +103,11 @@ instance-id: ${vm_name}-001
 local-hostname: ${vm_name}
 METADATA
 
-    genisoimage -quiet \
-        -output "$iso_path" \
-        -volid cidata \
-        -joliet -rock \
-        "$tmp_dir/user-data" "$tmp_dir/meta-data" 2>/dev/null
+    if ! hw6_make_cidata_iso "$iso_path" "$tmp_dir/user-data" "$tmp_dir/meta-data"; then
+        rm -rf "$tmp_dir"
+        echo "ERROR: need xorriso or genisoimage — run: dnf install -y xorriso" >&2
+        return 1
+    fi
 
     rm -rf "$tmp_dir"
     echo "$iso_path"
