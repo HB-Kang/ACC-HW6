@@ -16,6 +16,8 @@ HW6_SSH_KNOWN_HOSTS="${HW6_CONFIG_DIR}/ssh_known_hosts"
 HW6_CPU_CAP="${HW6_CPU_CAP:-8}"
 HW6_MEM_CAP_MB="${HW6_MEM_CAP_MB:-16384}"
 HW6_HOST_DOMAIN="${HW6_HOST_DOMAIN:-hw6.local}"
+# cloud-init ISOs stay off NFS — avoids "Resource temporarily unavailable" when B/C hold locks
+HW6_CLOUD_INIT_DIR="${HW6_CLOUD_INIT_DIR:-/var/tmp/hw6-cloud-init}"
 HW6_HOSTS_MARK_BEGIN="# BEGIN HW6 CLUSTER"
 HW6_HOSTS_MARK_END="# END HW6 CLUSTER"
 HW6_CLUSTER_HOSTS=(servera serverb serverc)
@@ -430,6 +432,55 @@ hw6_check_nfs_shared_storage() {
     mount | grep -q " on ${path} " && return 0
     mount | grep -q "${path}" && return 0
     return 1
+}
+
+# Remove VM definition on this host and on B/C (after migration) + disk on NFS
+hw6_cluster_undefine_vm() {
+    local vm="$1"
+    local images_dir="${2:-$HW6_NFS_DIR}"
+    local disk="${images_dir}/${vm}.qcow2"
+    local iso_nfs="${images_dir}/cloud-init-${vm}.iso"
+    local iso_local="${HW6_CLOUD_INIT_DIR}/cloud-init-${vm}.iso"
+
+    virsh destroy "$vm" 2>/dev/null || true
+    virsh undefine "$vm" --nvram 2>/dev/null || true
+    virsh undefine "$vm" --remove-all-storage 2>/dev/null || true
+
+    for peer in serverb serverc; do
+        hw6_ssh_test_host "$peer" || continue
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${peer}" \
+            "virsh destroy '${vm}' 2>/dev/null; virsh undefine '${vm}' --nvram 2>/dev/null; true" \
+            2>/dev/null || true
+    done
+
+    rm -f "$disk" "$iso_nfs" "$iso_local"
+}
+
+# Drop cloud-init CDROM from persistent XML (ISO was only needed for first boot)
+hw6_vm_detach_cloud_init_cdrom() {
+    local vm="$1"
+    local target was_running=0
+
+    if virsh domstate "$vm" 2>/dev/null | grep -q running; then
+        was_running=1
+        virsh destroy "$vm" >/dev/null 2>&1 || true
+    fi
+
+    target="$(virsh domblklist "$vm" --details 2>/dev/null \
+        | awk '$3 == "cdrom" && $4 == "raw" { print $1; exit }')"
+    if [[ -z "$target" ]]; then
+        target="$(virsh domblklist "$vm" 2>/dev/null \
+            | awk '$2 ~ /\.iso$/ { print $1; exit }')"
+    fi
+    [[ -n "$target" ]] || return 0
+
+    virsh detach-disk "$vm" "$target" --config 2>/dev/null \
+        || virsh change-media "$vm" "$target" --eject --config 2>/dev/null \
+        || true
+
+    if [[ "$was_running" -eq 1 ]]; then
+        virsh start "$vm" >/dev/null 2>&1 || true
+    fi
 }
 
 hw6_sshd_lab_config() {

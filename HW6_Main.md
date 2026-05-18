@@ -248,6 +248,7 @@ virsh migrate --live --persistent --undefinesource --unsafe \
 | `Unable to resolve … dclab` | B 호스트명이 `dclab` 등으로 남음 → `hostnamectl set-hostname serverb.hw6.local` |
 | `hostname … localhost` / FQDN | `127.0.0.1`에 호스트명 있으면 안 됨 → `setup_sub.sh` 재실행 또는 아래 수동 |
 | C만 `channel … I/O error` | C NFS 미마운트·FQDN·`migration_host` → **Host-C** `setup_sub.sh` 후 A에서 재시도 |
+| `cloud-init-vm-N.iso` Resource temporarily unavailable | NFS에 ISO + B/C에서 VM 실행 중 잠금 → `git pull` 후 `create_vms.sh` 재실행 (ISO는 `/var/tmp/hw6-cloud-init`) |
 
 **수동 수정 (B/C, git pull 후에도 migration 실패 시):**
 

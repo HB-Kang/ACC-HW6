@@ -19,7 +19,10 @@ else
     warn "No ${HW6_CONFIG_FILE} — using default image path"
 fi
 BASE_IMG="$IMAGES_DIR/jammy-base.img"
+CLOUD_INIT_DIR="$HW6_CLOUD_INIT_DIR"
 UBUNTU_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+
+mkdir -p "$CLOUD_INIT_DIR"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
 NC='\033[0m'; BOLD='\033[1m'
@@ -68,7 +71,7 @@ fi
 # ── [2] cloud-init ISO helper ─────────────────────────────────────────────────
 make_cloud_init_iso() {
     local vm_name="$1"
-    local iso_path="$IMAGES_DIR/cloud-init-${vm_name}.iso"
+    local iso_path="$CLOUD_INIT_DIR/cloud-init-${vm_name}.iso"
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
@@ -115,6 +118,13 @@ METADATA
 
 # ── [3] Create VMs ────────────────────────────────────────────────────────────
 echo -e "\n${CYAN}${BOLD}[STEP 2]${NC} Create VMs"
+info "cloud-init ISOs: ${CLOUD_INIT_DIR} (local — not NFS, avoids lock conflicts)"
+info "Removing old VM definitions on A/B/C before recreate..."
+for vm in "${VM_NAMES[@]}"; do
+    hw6_cluster_undefine_vm "$vm" "$IMAGES_DIR" 2>/dev/null || true
+done
+# Legacy ISOs on NFS from older script versions
+rm -f "$IMAGES_DIR"/cloud-init-vm-*.iso 2>/dev/null || true
 
 for vm in "${VM_NAMES[@]}"; do
     cpu="${VM_CPU[$vm]}"
@@ -124,14 +134,7 @@ for vm in "${VM_NAMES[@]}"; do
     echo ""
     info "Creating $vm (${cpu} vCPU / ${mem} MB RAM)..."
 
-    # Remove existing VM if present
-    if virsh dominfo "$vm" &>/dev/null; then
-        warn "$vm already exists — removing and recreating"
-        virsh destroy "$vm" 2>/dev/null || true
-        virsh undefine "$vm" --remove-all-storage 2>/dev/null || true
-    fi
-
-    # Disk from base image backing
+    # Disk from base image backing (qcow2 on NFS only)
     rm -f "$disk_path"
     qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMG" "$disk_path" 20G -q
     ok "Disk created: $disk_path (20G, backing: jammy-base)"
@@ -146,7 +149,7 @@ for vm in "${VM_NAMES[@]}"; do
         --vcpus "$cpu" \
         --memory "$mem" \
         --disk "path=${disk_path},format=qcow2,bus=virtio" \
-        --disk "path=${iso_path},device=cdrom" \
+        --disk "path=${iso_path},device=cdrom,readonly=on" \
         --import \
         --os-variant ubuntu22.04 \
         --network bridge=virbr0,model=virtio \
@@ -156,7 +159,8 @@ for vm in "${VM_NAMES[@]}"; do
         --noautoconsole \
         --quiet
 
-    ok "$vm created"
+    hw6_vm_detach_cloud_init_cdrom "$vm" 2>/dev/null || true
+    ok "$vm created (cloud-init CDROM detached from domain XML)"
 done
 
 # ── [4] Initial placement (migrate to B, C) ───────────────────────────────────
