@@ -154,15 +154,22 @@ VM 콘솔: `virsh console vm-1` (종료 `Ctrl+]`) · root 비밀번호 `hw6pass`
 
 ### Case 1~3 = Before / After 시연
 
-| Case | 키 | 목표 (개념) |
-|------|-----|-------------|
-| **1** Consolidation | `c` → `m` | Host-C **IDLE**, VM은 A·B로 |
-| **2** Defragmentation | `r` → `m` | CPU/MEM **쏠림 해소**, 3호스트 고르게 |
-| **3** Load balancing | `l` → `m` | 한 호스트 **과부하(80%+)** 완화 |
+| Case | BEFORE 키 | BEFORE 배치 (대시보드가 자동 구성) | 계획 키 → 실행 |
+|------|---|---|---|
+| **1** Consolidation | `1` | vm-1,2 → A · vm-3,4 → B · vm-5,6 → C (분산) | `c` → `m` (Host-C **IDLE**) |
+| **2** Defragmentation | `2` | vm-1,3 → A (8c, **CPU 100%**) · vm-2,4,5,6 → B · C 비움 | `r` → `m` (3호스트 고르게) |
+| **3** Load balancing | `3` | vm-1,2,3,4 → A (**11c 오버커밋**) · vm-5,6 → B · C 비움 | `l` → `m` (과부하 해소) |
+| (공통) Clean | `0` | A/B/C 의 vm-1..vm-6 전부 제거 | — |
 
-**실제로 호스트가 과부하일 필요는 없습니다.**  
-제출·시연은 **대시보드 Before → `c`/`r`/`l` 계획 → `m` Migration → After** 흐름과 스크린샷이면 충분합니다.  
-Case 3 “과부하”도 **시나리오 이름**에 가깝고, 숫자를 맞추고 싶을 때만 stress-ng를 쓰면 됩니다.
+**대시보드 안에서 BEFORE 상태를 자동으로 만들어 줍니다.** `[1]/[2]/[3]` 을 누르면 대시보드가 내부적으로 `hw6_preset.sh` 를 호출해서
+
+1. A·B·C 의 기존 VM 을 모두 제거하고
+2. Host-A 에서 vm-1~6 을 다시 생성한 뒤
+3. 케이스에 맞는 호스트로 live migrate 합니다 (`create_vms.sh` 와 동일한 메커니즘).
+
+STATUS 패널에 "PRESET BUILDING" 이 사라지고 LOG 에 `Preset 'caseN' complete` 가 뜨면 BEFORE 준비 완료입니다. 그 다음 `c`/`r`/`l` → `m` 으로 AFTER 데모를 진행하세요.
+
+**실제로 호스트가 과부하일 필요는 없습니다.** 제출·시연은 **BEFORE 스크린샷 → 계획 → 실행 → AFTER 스크린샷** 흐름이면 충분합니다. Case 3 “과부하”도 시나리오 이름에 가깝고, 숫자를 맞추고 싶을 때만 stress-ng 를 쓰면 됩니다.
 
 ---
 
@@ -176,20 +183,27 @@ python3 migration_dashboard.py
 
 **SSH 터미널:** **269×48** 권장 (Xshell/MobaXterm/PuTTY). 2열: 왼쪽 Host A/B/C, 오른쪽 STATUS+LOG (`rich` Layout, ASCII 박스).
 
-| 키 | 동작 | Case |
+| 키 | 동작 | 비고 |
 |----|------|------|
-| `c` | Consolidation (Host-C Idle) | **Case 1** |
-| `r` | 균등 분산 Bin Packing | **Case 2** |
-| `l` | 과부하( CPU 80%+ ) 분산 | **Case 3** |
-| `m` | Live Migration 실행 | 공통 |
+| `1` | **Case 1 BEFORE** 구성 (분산 배치) | 자동: VM 제거 → 재생성 → 마이그레이션 |
+| `2` | **Case 2 BEFORE** 구성 (vm-1,3 → A 쏠림) | 〃 |
+| `3` | **Case 3 BEFORE** 구성 (A 오버커밋) | 〃 |
+| `0` | A/B/C 의 vm-1..vm-6 전부 제거 | 빈 상태로 복귀 |
+| `c` | Consolidation 계획 (Host-C Idle) | Case 1 후 |
+| `r` | 균등 분산 Bin Packing 계획 | Case 2 후 |
+| `l` | 과부하 분산 계획 (CPU 80%+) | Case 3 후 |
+| `m` | 위 계획대로 Live Migration 실행 | 공통 |
 | `q` | 종료 | — |
 
 ### 시연 순서 (A)
 
-1. **Before** 스크린샷 (3호스트, ◇ alloc 위주)  
-2. `c` / `r` / `l` → STATUS **재배치 계획** 캡처  
-3. `m` → Migration 진행·Dirty rate 캡처  
-4. **After** 스크린샷 + `domjobinfo` Downtime  
+1. 대시보드 실행 (`python3 migration_dashboard.py`)
+2. `1` / `2` / `3` 중 하나 눌러 **BEFORE 자동 구성** (몇 분 소요)
+3. STATUS 의 "PRESET BUILDING" 이 사라지고 LOG 에 `Preset complete` 보이면 → **Before 스크린샷**
+4. 같은 케이스에 맞는 `c` / `r` / `l` 키 → STATUS **재배치 계획** 캡처
+5. `m` → Migration 진행·Dirty rate 캡처
+6. **After 스크린샷** + `domjobinfo` Downtime
+7. 다음 케이스로 넘어가려면 다시 `1` / `2` / `3` (이전 VM 자동 정리)
 
 ### stress-ng (선택 — 숫자 연출용)
 
@@ -229,8 +243,9 @@ virsh migrate --live --persistent --undefinesource --unsafe \
 
 ### VM·실험
 
-- [ ] `create_vms.sh` → VM 6대
-- [ ] 대시보드 `r`/`c`/`l`/`m` 동작
+- [ ] `create_vms.sh` → VM 6대 (최초 1회 / 또는 대시보드 `1` 로 대체 가능)
+- [ ] 대시보드 `1`/`2`/`3` 으로 BEFORE 자동 구성
+- [ ] `c`/`r`/`l` + `m` 으로 AFTER 시연
 - [ ] Case 1~3 Before/After·Downtime 수집
 
 ### 제출 (팀 PDF)

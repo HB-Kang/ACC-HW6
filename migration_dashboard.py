@@ -156,6 +156,8 @@ mig_history:     List[MigrationJob] = []
 log_lines:       List[Tuple[str, str, str]] = []   # (time, level, msg)
 bin_pack_plan:   Dict[str, str] = {}               # vm_name → target_host
 running:         bool = True
+preset_running:  bool = False                       # one preset job at a time
+preset_status:   str = ""                           # latest "case1 (distributed)" line for STATUS panel
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  virsh helpers
@@ -619,6 +621,77 @@ def execute_migrations():
     threading.Thread(target=_run_all, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Preset placement (hw6_preset.sh — clean / case1 / case2 / case3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+PRESET_SCRIPT = Path(__file__).resolve().parent / "hw6_preset.sh"
+
+# Friendly status text shown in the STATUS panel while a preset runs.
+PRESET_LABELS = {
+    "clean": "Clean: removing vm-1..vm-6 on A/B/C",
+    "case1": "Case 1 BEFORE: vm-1,2 -> A | vm-3,4 -> B | vm-5,6 -> C",
+    "case2": "Case 2 BEFORE: vm-1,3 -> A | vm-2,4,5,6 -> B | C idle",
+    "case3": "Case 3 BEFORE: vm-1,2,3,4 -> A | vm-5,6 -> B | C idle",
+}
+
+
+def run_preset(action: str) -> None:
+    """Invoke hw6_preset.sh ACTION in a worker thread; pipe its output to LOG."""
+    global preset_running, preset_status
+
+    if not PRESET_SCRIPT.is_file():
+        log("ERR", f"preset script missing: {PRESET_SCRIPT}")
+        return
+
+    with _lock:
+        if preset_running:
+            log("WRN", "Preset already running — wait for it to finish")
+            return
+        preset_running = True
+        preset_status = PRESET_LABELS.get(action, action)
+
+    log("INF", f"Preset start: {preset_status}")
+
+    def _worker():
+        global preset_running, preset_status
+        cmd = ["bash", str(PRESET_SCRIPT), action]
+        rc = -1
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip()
+                if not line:
+                    continue
+                # hw6_preset.sh prefixes with "[PRESET] LVL message"
+                m = re.match(r"\[PRESET\]\s+(OK|INF|WRN|ERR)\s+(.*)", line)
+                if m:
+                    lvl, msg = m.group(1), m.group(2)
+                else:
+                    lvl, msg = "INF", line
+                log(lvl, msg)
+                with _lock:
+                    preset_status = msg[:80]
+            rc = proc.wait()
+        except FileNotFoundError:
+            log("ERR", "bash not found")
+        except Exception as exc:
+            log("ERR", f"preset failed: {exc}")
+        finally:
+            with _lock:
+                preset_running = False
+                preset_status = ""
+            if rc == 0:
+                log("OK", f"Preset '{action}' complete — press [c]/[r]/[l] + [m]")
+            else:
+                log("WRN", f"Preset '{action}' exited rc={rc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -704,10 +777,14 @@ def _present(layout: Layout, width: int, height: int) -> None:
 def _footer_plain() -> str:
     parts = []
     for key, desc in (
-        ("[r]", "Spread BinPack"),
-        ("[c]", "Consolidate (C idle)"),
-        ("[l]", "Load balance"),
-        ("[m]", "Run migration"),
+        ("[1]", "Case1 BEFORE"),
+        ("[2]", "Case2 BEFORE"),
+        ("[3]", "Case3 BEFORE"),
+        ("[0]", "Clean VMs"),
+        ("[c]", "C-Idle"),
+        ("[r]", "Defrag"),
+        ("[l]", "LoadBal"),
+        ("[m]", "Migrate"),
         ("[q]", "Quit"),
     ):
         parts.append(f"{key} {desc}")
@@ -860,6 +937,17 @@ def _render_status_panel(*, panel_height: Optional[int] = None) -> Panel:
     with _lock:
         mig  = active_mig
         plan = dict(bin_pack_plan)
+        preset_busy = preset_running
+        preset_msg  = preset_status
+
+    # ── Preset job in progress (clean / case1 / case2 / case3) ────────────────
+    if preset_busy:
+        t = Text()
+        t.append("PRESET BUILDING\n\n", style="bold magenta")
+        t.append(preset_msg or "Working...", style="white")
+        t.append("\n\nWait for OK, then [c]/[r]/[l] -> [m]", style="dim")
+        return _boxed(t, title="PRESET", border_style="magenta",
+                      panel_height=panel_height)
 
     # ── Migration in progress ────────────────────────────────────────────────
     if mig:
@@ -957,7 +1045,12 @@ def _render_status_panel(*, panel_height: Optional[int] = None) -> Panel:
         return _boxed(hist, title="MIGRATION STATS", border_style="green",
                       panel_height=panel_height)
 
-    t = Text("Idle — use footer keys", style="dim")
+    t = Text()
+    t.append("Idle\n\n", style="dim")
+    t.append("Step 1) [1] / [2] / [3]  build preset\n", style="white")
+    t.append("Step 2) [c] / [r] / [l]  plan migration\n", style="white")
+    t.append("Step 3) [m]              run migration\n", style="white")
+    t.append("[0] clean all VMs        [q] quit\n", style="dim")
     return _boxed(t, title="STATUS", border_style="dim", panel_height=panel_height)
 
 
@@ -1064,6 +1157,14 @@ def _handle_key(key: str):
         threading.Thread(target=run_load_balance, daemon=True).start()
     elif key == "m":
         threading.Thread(target=execute_migrations, daemon=True).start()
+    elif key == "0":
+        run_preset("clean")
+    elif key == "1":
+        run_preset("case1")
+    elif key == "2":
+        run_preset("case2")
+    elif key == "3":
+        run_preset("case3")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Config loader
