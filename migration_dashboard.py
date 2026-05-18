@@ -664,27 +664,40 @@ def _layout_sizes(term_rows: int, term_cols: int) -> Dict[str, int]:
     }
 
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*[a-zA-Z]")
+
+
+def _visible_len(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+
 def _fit_line(s: str, width: int) -> str:
-    """One terminal row, no newline (plain chars only for width)."""
-    plain = re.sub(r"\033\[[0-9;]*m", "", s)
-    if len(plain) <= width:
-        return plain.ljust(width)
-    return plain[: max(0, width - 3)] + "..."
+    """Preserve ANSI styling; pad/truncate to exactly `width` visible chars."""
+    vlen = _visible_len(s)
+    if vlen == width:
+        return s
+    if vlen < width:
+        return s + " " * (width - vlen)
+    plain = _ANSI_RE.sub("", s)
+    if width <= 3:
+        return plain[:width]
+    return plain[: width - 3] + "..."
 
 
 def _present(layout: Layout, width: int, height: int) -> None:
-    """Paint exactly `height` rows — no Rich Live / alternate screen (no scroll bump)."""
+    """Paint exactly `height` rows at absolute cursor positions (raw-tty safe)."""
     with console.capture() as capture:
         console.print(layout, width=width, height=height, overflow="crop")
     lines = capture.get().splitlines()
     lines = lines[:height]
     while len(lines) < height:
         lines.append("")
-    sys.stdout.write("\033[H\033[J")
+    out = ["\033[H"]                       # home cursor (do not clear → less flicker)
     for i, raw in enumerate(lines):
-        sys.stdout.write(_fit_line(raw, width))
-        if i < height - 1:
-            sys.stdout.write("\n")
+        out.append(f"\033[{i + 1};1H")     # row=i+1, col=1 (absolute)
+        out.append(_fit_line(raw, width))
+        out.append("\033[K")               # erase any leftover chars to row end
+    sys.stdout.write("".join(out))
     sys.stdout.flush()
 
 
@@ -1153,6 +1166,8 @@ def main():
         )
 
     log("OK",  "Dashboard started")
+    log("INF", f"terminal {tw}x{th}  draw {safe_w}x{sizes['total']}  "
+              f"bar={sizes['bar_w']}")
     log("INF", f"libvirt — A:{HOSTS_CONFIG['Host-A']['ip']} "
               f"B:{HOSTS_CONFIG['Host-B']['ip']} "
               f"C:{HOSTS_CONFIG['Host-C']['ip']}")
@@ -1166,7 +1181,8 @@ def main():
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        sys.stdout.write("\033[?25l")
+        # ?25l: hide cursor | ?7l: disable auto-wrap | 2J: clear once | H: home
+        sys.stdout.write("\033[?25l\033[?7l\033[2J\033[H")
         sys.stdout.flush()
         while running:
             _render(layout, sizes)
@@ -1179,7 +1195,8 @@ def main():
                 _handle_key(key)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\033[?25h\033[H\033[J")
+        # restore: auto-wrap, cursor, clear screen
+        sys.stdout.write("\033[?7h\033[?25h\033[2J\033[H")
         sys.stdout.flush()
         console.print("[dim]Dashboard exited.[/dim]")
 
