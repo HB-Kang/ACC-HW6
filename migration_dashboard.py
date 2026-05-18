@@ -91,12 +91,17 @@ HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 UI_REFRESH_SEC   = 1.0   # keyboard poll interval
-# SSH terminal 209×41 — 2-column UI: hosts (left) | status+log (right)
+# SSH terminal 209×41 target — 2-column UI: hosts (left) | status+log (right)
 TERM_COLS = 209
 TERM_ROWS = 41
-LOG_MAX_LINES      = 12
-VM_LINES_PER_HOST  = 3
-HOST_BAR_WIDTH     = 22   # per host panel in left column (~100 cols)
+TERM_MARGIN = 1   # avoid drawing in last column (wrap → +1 line → "floating")
+ROW_MARGIN = 1    # layout height = rows - ROW_MARGIN (never scroll alternate screen)
+LOG_MAX_LINES = 12
+VM_LINES_PER_HOST = 3
+HOST_BAR_WIDTH = 22
+
+# Filled in main() from actual terminal size
+_ui: Dict[str, int] = {}
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -618,8 +623,48 @@ def execute_migrations():
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Width fixed to 209; height follows terminal (fixed height clips panels)
-console = Console(width=TERM_COLS, force_terminal=True)
+console = Console(width=TERM_COLS - TERM_MARGIN, force_terminal=True)
+
+
+def _layout_sizes(term_rows: int) -> Dict[str, int]:
+    """Partition rows so header+main+footer never exceeds terminal (prevents 1-line scroll bump)."""
+    total = max(24, term_rows - ROW_MARGIN)
+    header, footer = 3, 1
+    main = total - header - footer
+    host_h = max(7, main // 3)
+    while host_h * 3 > main:
+        host_h -= 1
+    status_h = max(6, main // 3)
+    log_h = max(4, main - status_h)
+    if status_h + log_h > main:
+        status_h = max(6, main - log_h)
+    return {
+        "total": total,
+        "header": header,
+        "main": main,
+        "footer": footer,
+        "host_h": host_h,
+        "status_h": status_h,
+        "log_h": log_h,
+    }
+
+
+def _footer_plain() -> str:
+    parts = []
+    for key, desc in (
+        ("[r]", "Spread BinPack"),
+        ("[c]", "Consolidate (C idle)"),
+        ("[l]", "Load balance"),
+        ("[m]", "Run migration"),
+        ("[q]", "Quit"),
+    ):
+        parts.append(f"{key} {desc}")
+    parts.append(time.strftime("%H:%M:%S"))
+    line = "   ".join(parts)
+    w = _ui.get("width", TERM_COLS - TERM_MARGIN)
+    if len(line) > w:
+        line = line[: max(0, w - 3)] + "..."
+    return line
 
 
 def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> Text:
@@ -753,7 +798,7 @@ def _render_status_panel() -> Panel:
         mb_proc  = mig.data_proc_b  / 1024 / 1024
         mb_total = mig.data_total_b / 1024 / 1024
 
-        bar_w = min(48, (TERM_COLS // 2) - 28)
+        bar_w = min(48, _ui.get("width", TERM_COLS) // 2 - 28)
         fill  = int(pct / 100 * bar_w)
         bar   = Text()
         bar.append("█" * fill,          style="bold blue")
@@ -867,10 +912,11 @@ def _render_log_panel() -> Panel:
     grid.add_column(width=5)
     grid.add_column()
 
+    log_n = min(LOG_MAX_LINES, max(4, _ui.get("log_h", 12) - 2))
     with _lock:
-        lines = list(log_lines[-LOG_MAX_LINES:])
+        lines = list(log_lines[-log_n:])
 
-    msg_w = max(40, (TERM_COLS // 2) - 22)
+    msg_w = max(40, _ui.get("width", TERM_COLS) // 2 - 22)
     for ts, lvl, msg in lines:
         if len(msg) > msg_w:
             msg = msg[: msg_w - 1] + "…"
@@ -882,30 +928,26 @@ def _render_log_panel() -> Panel:
     return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
 
 
-def _build_layout() -> Layout:
-    """
-    209×41 — 2 columns:
-      left  (~104): Host-A, B, C stacked
-      right (~104): STATUS + LOG
-    """
-    layout = Layout()
+def _build_layout(sizes: Dict[str, int]) -> Layout:
+    """2 columns: hosts (left) | status+log (right); heights match terminal rows."""
+    layout = Layout(size=sizes["total"])
     layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main", size=36),
-        Layout(name="footer", size=1),
+        Layout(name="header", size=sizes["header"]),
+        Layout(name="main", size=sizes["main"]),
+        Layout(name="footer", size=sizes["footer"]),
     )
     layout["main"].split_row(
         Layout(name="hosts_col", ratio=1),
         Layout(name="info_col", ratio=1),
     )
     layout["hosts_col"].split_column(
-        Layout(name="host_a", size=12),
-        Layout(name="host_b", size=12),
-        Layout(name="host_c", size=12),
+        Layout(name="host_a", size=sizes["host_h"]),
+        Layout(name="host_b", size=sizes["host_h"]),
+        Layout(name="host_c", size=sizes["host_h"]),
     )
     layout["info_col"].split_column(
-        Layout(name="status", size=14),
-        Layout(name="log", size=22),
+        Layout(name="status", size=sizes["status_h"]),
+        Layout(name="log", size=sizes["log_h"]),
     )
     return layout
 
@@ -934,18 +976,10 @@ def _render(layout: Layout) -> None:
     layout["status"].update(_render_status_panel())
     layout["log"].update(_render_log_panel())
 
-    footer = Text(justify="center")
-    for key, desc in (
-        ("[r]", "Spread BinPack"),
-        ("[c]", "Consolidate (C idle)"),
-        ("[l]", "Load balance"),
-        ("[m]", "Run migration"),
-        ("[q]", "Quit"),
-    ):
-        footer.append(key, style="bold yellow")
-        footer.append(f" {desc}   ", style="dim")
-    footer.append(time.strftime("%H:%M:%S"), style="dim")
-    layout["footer"].update(Align.center(footer))
+    # Single-line footer (no Panel border — extra lines caused scroll "float")
+    layout["footer"].update(
+        Align.center(Text(_footer_plain(), style="dim", no_wrap=True))
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Key handling
@@ -1049,11 +1083,17 @@ def main():
 
     _init_hosts()
 
+    global console, _ui
     tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
+    safe_w = min(tw, TERM_COLS) - TERM_MARGIN
+    sizes = _layout_sizes(th)
+    _ui = {"width": safe_w, "height": sizes["total"], **sizes}
+    console = Console(width=safe_w, height=sizes["total"], force_terminal=True)
+
     if tw != TERM_COLS or th != TERM_ROWS:
         console.print(
-            f"[dim]Layout {TERM_COLS}x{TERM_ROWS} — your terminal is {tw}x{th} "
-            f"(resize SSH window to match for best fit)[/dim]"
+            f"[dim]Target {TERM_COLS}x{TERM_ROWS} — yours {tw}x{th} "
+            f"(using {safe_w}x{sizes['total']} draw area)[/dim]"
         )
 
     log("OK",  "Dashboard started")
@@ -1065,18 +1105,24 @@ def main():
     upd = threading.Thread(target=_update_loop, daemon=True)
     upd.start()
 
-    layout = _build_layout()
+    layout = _build_layout(sizes)
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        with Live(
-            layout,
+        live_kw = dict(
             console=console,
             screen=True,
             transient=True,
             auto_refresh=False,
             refresh_per_second=1,
-        ) as live:
+            vertical_overflow="crop",
+        )
+        try:
+            live_ctx = Live(layout, **live_kw)
+        except TypeError:
+            live_kw.pop("vertical_overflow", None)
+            live_ctx = Live(layout, **live_kw)
+        with live_ctx as live:
             while running:
                 _render(layout)
                 live.refresh()
