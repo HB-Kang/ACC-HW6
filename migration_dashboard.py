@@ -41,6 +41,7 @@ Platform
   Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
+import os
 import shutil
 import subprocess
 import threading
@@ -160,12 +161,46 @@ preset_running:  bool = False                       # one preset job at a time
 preset_status:   str = ""                           # latest "case1 (distributed)" line for STATUS panel
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SSH ControlMaster helpers  — one persistent TCP connection per host
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SSH_CTRL_DIR = "/tmp/hw6dash"
+
+# Shared SSH options used everywhere: ControlMaster reuses one TCP connection
+# per host, eliminating the flood of new SSH handshakes that overwhelmed sshd
+# (and could drop the Xshell session) during live migration.
+_SSH_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=5",
+    "-o", f"ControlPath={_SSH_CTRL_DIR}/%h",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPersist=60",
+    "-o", "ServerAliveInterval=20",
+    "-o", "ServerAliveCountMax=3",
+    "-o", "StrictHostKeyChecking=accept-new",
+]
+
+_local_a_ip: str = ""   # filled in after HOSTS_CONFIG is loaded
+
+
+def _is_local(host_ip: str) -> bool:
+    """True when host_ip is Host-A (the machine running this dashboard)."""
+    return bool(_local_a_ip) and host_ip == _local_a_ip
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  virsh helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _virsh(host_ip: str, *args, timeout: int = 10) -> str:
-    """Run remote virsh command. Returns empty string on failure."""
-    cmd = ["virsh", "-c", f"qemu+ssh://root@{host_ip}/system"] + list(args)
+    """Run virsh on host_ip.
+    Host-A: local virsh (no SSH).
+    Host-B/C: ssh ControlMaster + remote virsh (one TCP conn per host).
+    """
+    if _is_local(host_ip):
+        cmd = ["virsh"] + list(args)
+    else:
+        cmd = ["ssh"] + _SSH_OPTS + [f"root@{host_ip}", "virsh"] + list(args)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout if r.returncode == 0 else ""
@@ -241,11 +276,11 @@ def _parse_ms_field(s: str) -> Optional[int]:
 
 
 def _ssh_script(host_ip: str, script: str, timeout: int = 10) -> str:
-    """Run a bash script on the host via SSH (same trust as virsh)."""
-    cmd = [
-        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-        f"root@{host_ip}", "bash", "-s",
-    ]
+    """Run a bash script on the host via SSH (ControlMaster reuse)."""
+    if _is_local(host_ip):
+        cmd = ["bash", "-s"]
+    else:
+        cmd = ["ssh"] + _SSH_OPTS + [f"root@{host_ip}", "bash", "-s"]
     try:
         r = subprocess.run(
             cmd, input=script, capture_output=True, text=True, timeout=timeout
@@ -586,12 +621,7 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
             f"--migrateuri 'tcp://{dst_ip}:0' "
             f"'{vm_name}' '{dest_uri}'"
         )
-        cmd = [
-            "ssh", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            f"root@{src_fqdn}",
-            remote_cmd,
-        ]
+        cmd = ["ssh"] + _SSH_OPTS + [f"root@{src_fqdn}", remote_cmd]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
@@ -656,9 +686,9 @@ PRESET_SCRIPT = Path(__file__).resolve().parent / "hw6_preset.sh"
 # Friendly status text shown in the STATUS panel while a preset runs.
 PRESET_LABELS = {
     "clean": "Clean: removing vm-1..vm-6 on A/B/C",
-    "case1": "Case 1 BEFORE: vm-1,2 -> A | vm-3,4 -> B | vm-5,6 -> C",
-    "case2": "Case 2 BEFORE: vm-1,3 -> A | vm-2,4,5,6 -> B | C idle",
-    "case3": "Case 3 BEFORE: vm-1,2,3,4 -> A | vm-5,6 -> B | C idle",
+    "case1": "Consolidation BEFORE: vm-1,2->A | vm-3,4->B | vm-5,6->C  (distributed, use [c]+[m])",
+    "case2": "Defrag BEFORE: vm-1,3->A | vm-2,4,5,6->B | C idle  (skewed, use [r]+[m])",
+    "case3": "LoadBal BEFORE: vm-1,2,3,4->A | vm-5,6->B | C idle  (overloaded, use [l]+[m])",
 }
 
 
@@ -804,11 +834,11 @@ def _present(layout: Layout, width: int, height: int) -> None:
 def _footer_plain() -> str:
     parts = []
     for key, desc in (
-        ("[1]", "Case1 BEFORE"),
-        ("[2]", "Case2 BEFORE"),
-        ("[3]", "Case3 BEFORE"),
+        ("[1]", "Consolidation BEFORE"),
+        ("[2]", "Defrag BEFORE"),
+        ("[3]", "LoadBal BEFORE"),
         ("[0]", "Clean VMs"),
-        ("[c]", "C-Idle"),
+        ("[c]", "Consolidation"),
         ("[r]", "Defrag"),
         ("[l]", "LoadBal"),
         ("[m]", "Migrate"),
@@ -1269,13 +1299,19 @@ def _init_hosts():
 
 
 def main():
-    global running, HOSTS_CONFIG, console, _ui
+    global running, HOSTS_CONFIG, console, _ui, _local_a_ip
 
     try:
         HOSTS_CONFIG = load_hosts_config()
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[bold red]Config error:[/bold red] {exc}")
         sys.exit(1)
+
+    # ControlMaster socket dir — one persistent TCP conn per cluster host
+    os.makedirs(_SSH_CTRL_DIR, mode=0o700, exist_ok=True)
+
+    # Cache Host-A IP so _is_local() works without scanning HOSTS_CONFIG each call
+    _local_a_ip = HOSTS_CONFIG.get("Host-A", {}).get("ip", "")
 
     _init_hosts()
 
