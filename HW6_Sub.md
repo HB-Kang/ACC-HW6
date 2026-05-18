@@ -216,6 +216,18 @@ virsh migrate --live --unsafe --tunnelled --p2p \
 
 `cannot perform tunnelled migration without using peer2peer flag` → 스크립트가 `--tunnelled --p2p` 로 재시도함 (`git pull` 후 재실행).
 
+`argument unsupported` / `QEMU unexpectedly closed the monitor` (C만):
+
+- **호스트명**이 아직 `dclab` 이거나 `hostname -f` → `127.0.0.1` 인 경우가 많음 → C에서 `setup_sub.sh` 또는 A에서 진단:
+
+```bash
+cd ~/ACC-HW6 && git pull
+sudo bash hw6_diag_migration.sh    # Host-A에서 실행
+```
+
+- C가 **VirtualBox VM**이면 Nested VT-x/AMD-V 켜기 (없으면 QEMU가 C에서 바로 죽음)
+- `serverc.hw6.local` → **C의 실제 IP** 로 풀려야 함 (`getent hosts $(hostname -f)`)
+
 ---
 
 **A 쪽 설치·실험 전체**는 [HW6_Main.md](HW6_Main.md)만 보면 됩니다.

@@ -128,7 +128,7 @@ hw6_load_config() {
 }
 
 hw6_migrate_dest_uri() {
-    echo "qemu+ssh://root@$(hw6_cluster_ip_for_short "$1")/system"
+    echo "qemu+ssh://root@$(hw6_fqdn "$1")/system"
 }
 
 hw6_ensure_config() {
@@ -210,26 +210,76 @@ hw6_configure_libvirt_migration() {
     ok_cb "libvirt migration_host=${ip}"
 }
 
-# Apply migration_host on a remote host (B/C) from Host-A before migrate
-hw6_remote_ensure_migration_config() {
+# Fix hostname, /etc/hosts HW6 block, migration_host on B/C from Host-A (C often still dclab/localhost)
+hw6_remote_repair_migration_target() {
     local short="$1"
-    local ip
+    local fqdn ip
+
+    fqdn="$(hw6_fqdn "$short")"
     ip="$(hw6_cluster_ip_for_short "$short")" || return 1
     hw6_ssh_test_host "$short" || return 1
 
-    ssh -o BatchMode=yes -o ConnectTimeout=15 "root@${short}" bash -s -- "$ip" <<'EOS' || return 1
+    ssh -o BatchMode=yes -o ConnectTimeout=20 "root@${short}" bash -s -- \
+        "$fqdn" "$ip" "$HW6_HOST_DOMAIN" "$HOST_A_IP" "$HOST_B_IP" "$HOST_C_IP" <<'EOS' || return 1
 set -e
-ip="$1"
+fqdn="$1"
+myip="$2"
+dom="$3"
+aip="$4"
+bip="$5"
+cip="$6"
+hf="/etc/hosts"
+mb="# BEGIN HW6 CLUSTER"
+me="# END HW6 CLUSTER"
+
+hostnamectl set-hostname "$fqdn"
+sed -i 's/^127\.0\.0\.1.*/127.0.0.1   localhost localhost.localdomain localhost4/' "$hf"
+sed -i 's/^::1.*/::1         localhost localhost.localdomain localhost6/' "$hf"
+
+tmp="$(mktemp)"
+if grep -qF "$mb" "$hf" 2>/dev/null; then
+    awk -v b="$mb" -v e="$me" '$0==b{skip=1} $0==e{skip=0;next} !skip{print}' "$hf" > "$tmp"
+else
+    cp "$hf" "$tmp"
+fi
+{
+    cat "$tmp"
+    echo ""
+    echo "$mb"
+    printf '%s\t%s %s\n' "$aip" "servera.${dom}" "servera"
+    printf '%s\t%s %s\n' "$bip" "serverb.${dom}" "serverb"
+    printf '%s\t%s %s\n' "$cip" "serverc.${dom}" "serverc"
+    echo "$me"
+} > "${tmp}.new"
+install -m 644 "${tmp}.new" "$hf"
+rm -f "$tmp" "${tmp}.new"
+
 qconf="/etc/libvirt/qemu.conf"
 [[ -f "$qconf" ]] || exit 1
 if grep -qE '^#?migration_host' "$qconf"; then
-    sed -i "s|^#\\?migration_host.*|migration_host = \"${ip}\"|" "$qconf"
+    sed -i "s|^#\\?migration_host.*|migration_host = \"${myip}\"|" "$qconf"
 else
-    printf '\nmigration_host = "%s"\n' "$ip" >> "$qconf"
+    printf '\nmigration_host = "%s"\n' "$myip" >> "$qconf"
 fi
 systemctl try-restart libvirtd 2>/dev/null || systemctl restart libvirtd
+
+resolved="$(getent hosts "$(hostname -f)" | awk '{print $1}' | head -1)"
+if [[ -z "$resolved" || "$resolved" == "127.0.0.1" || "$resolved" != "$myip" ]]; then
+    echo "hostname broken: $(hostname -f) -> ${resolved:-?} (want ${myip})"
+    exit 1
+fi
 EOS
-    ok_cb "Remote migration_host=${ip} on ${short}"
+    ok_cb "Repaired ${short}: ${fqdn} -> ${ip}"
+    return 0
+}
+
+hw6_migration_clear_dest_domain() {
+    local vm="$1"
+    local short="$2"
+    hw6_ssh_test_host "$short" || return 0
+    ssh -o BatchMode=yes "root@${short}" \
+        "virsh destroy '${vm}' 2>/dev/null; virsh undefine '${vm}' --nvram 2>/dev/null; true" \
+        2>/dev/null || true
 }
 
 # 127.0.0.1 must not map the cluster hostname (breaks live migration on libvirt 9+)
@@ -422,8 +472,10 @@ EOS
         return 1
     fi
 
-    hw6_remote_ensure_migration_config "$short" || \
-        warn_cb "Could not set migration_host on ${short} — run setup_sub.sh there"
+    hw6_remote_repair_migration_target "$short" || {
+        warn_cb "Repair failed on ${short} — on that host: sudo bash setup_sub.sh"
+        return 1
+    }
 
     ok_cb "Preflight OK: ${short} (${ip})"
     return 0
@@ -434,41 +486,32 @@ EOS
 # dest_short: serverb|serverc — sets --migrateuri tcp://<cluster-ip>:0 for the data channel.
 hw6_virsh_migrate_live() {
     local vm_name="$1"
-    local dest_uri="$2"
+    local _dest_uri_ignored="$2"
     local dest_short="${3:-}"
     local dest_ip=""
+    local dest_uri=""
     local base=(--live --persistent --undefinesource --unsafe)
-    local miguri_tcp=()
-    local miguri_qemu=()
 
-    if [[ -n "$dest_short" ]]; then
-        dest_ip="$(hw6_cluster_ip_for_short "$dest_short")" || true
-        hw6_remote_ensure_migration_config "$dest_short" 2>/dev/null || true
+    [[ -n "$dest_short" ]] || { warn_cb "hw6_virsh_migrate_live: need dest_short (serverb|serverc)"; return 1; }
+
+    dest_ip="$(hw6_cluster_ip_for_short "$dest_short")" || return 1
+    dest_uri="$(hw6_migrate_dest_uri "$dest_short")"
+
+    hw6_remote_repair_migration_target "$dest_short" || return 1
+    hw6_migration_clear_dest_domain "$vm_name" "$dest_short"
+
+    if ! virsh -c "$dest_uri" version &>/dev/null; then
+        warn_cb "Cannot connect to ${dest_uri} — check SSH and libvirtd on ${dest_short}"
+        return 1
     fi
-    [[ -z "$dest_uri" && -n "$dest_short" ]] && dest_uri="$(hw6_migrate_dest_uri "$dest_short")"
-    [[ -n "$dest_ip" ]] && miguri_tcp=(--migrateuri "tcp://${dest_ip}:0")
-    [[ -n "$dest_ip" ]] && miguri_qemu=(--migrateuri "qemu+tcp://${dest_ip}/system")
 
-    # 1) Direct data channel to cluster IP
-    if virsh migrate "${base[@]}" "${miguri_tcp[@]}" "$vm_name" "$dest_uri"; then
+    # FQDN in dest URI + cluster IP for RAM channel (avoids localhost / dclab on C)
+    if virsh migrate "${base[@]}" --migrateuri "tcp://${dest_ip}:0" \
+        "$vm_name" "$dest_uri"; then
         return 0
     fi
 
-    # 2) qemu+tcp migrate URI
-    if [[ ${#miguri_qemu[@]} -gt 0 ]]; then
-        warn_cb "${vm_name}: retry migrateuri qemu+tcp://${dest_ip}/system"
-        if virsh migrate "${base[@]}" "${miguri_qemu[@]}" "$vm_name" "$dest_uri"; then
-            return 0
-        fi
-    fi
-
-    # 3) P2P (--tunnelled alone fails: needs --p2p on libvirt 9+)
-    warn_cb "${vm_name}: retry with --p2p"
-    if virsh migrate "${base[@]}" "${miguri_tcp[@]}" --p2p "$vm_name" "$dest_uri"; then
-        return 0
-    fi
-
-    warn_cb "${vm_name}: retry with --tunnelled --p2p (over SSH, no separate channel)"
+    warn_cb "${vm_name}: retry --tunnelled --p2p (no qemu+tcp / --p2p-only — unsupported on Rocky 10)"
     virsh migrate "${base[@]}" --tunnelled --p2p "$vm_name" "$dest_uri"
 }
 
