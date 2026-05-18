@@ -42,9 +42,9 @@ ok "Config: ${HW6_CONFIG_FILE}"
 SUBNET="$HW6_SUBNET"
 NFS_DIR="$HW6_NFS_DIR"
 
-# ── [1] /etc/hosts ────────────────────────────────────────────────────────────
-step 1 "Configure /etc/hosts"
-hw6_hosts_inject
+# ── [1] Hostname + /etc/hosts (FQDN for live migration) ───────────────────────
+step 1 "Configure hostname and /etc/hosts"
+hw6_configure_cluster_hostname servera
 
 # ── [2] System update + OpenSSH ───────────────────────────────────────────────
 step 2 "System update and OpenSSH"

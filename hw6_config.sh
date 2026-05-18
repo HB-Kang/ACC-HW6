@@ -15,6 +15,7 @@ HW6_NFS_KEYS_DIR="${HW6_NFS_DIR}/hw6/keys"
 HW6_SSH_KNOWN_HOSTS="${HW6_CONFIG_DIR}/ssh_known_hosts"
 HW6_CPU_CAP="${HW6_CPU_CAP:-8}"
 HW6_MEM_CAP_MB="${HW6_MEM_CAP_MB:-16384}"
+HW6_HOST_DOMAIN="${HW6_HOST_DOMAIN:-hw6.local}"
 HW6_HOSTS_MARK_BEGIN="# BEGIN HW6 CLUSTER"
 HW6_HOSTS_MARK_END="# END HW6 CLUSTER"
 HW6_CLUSTER_HOSTS=(servera serverb serverc)
@@ -103,6 +104,7 @@ HOST_C_D=${HOST_C_D}
 NFS_DIR=${HW6_NFS_DIR}
 CPU_CAP=${HW6_CPU_CAP}
 MEM_CAP_MB=${HW6_MEM_CAP_MB}
+HOST_DOMAIN=${HW6_HOST_DOMAIN}
 EOF
 
     chmod 644 "$HW6_CONFIG_FILE"
@@ -118,8 +120,13 @@ hw6_load_config() {
     [[ -f "$file" ]] || return 1
     # shellcheck disable=SC1090
     source "$file"
+    [[ -n "${HOST_DOMAIN:-}" ]] && HW6_HOST_DOMAIN="$HOST_DOMAIN"
     [[ -n "$HOST_A_IP" && -n "$HOST_B_IP" && -n "$HOST_C_IP" ]] || return 1
     return 0
+}
+
+hw6_migrate_dest_uri() {
+    echo "qemu+ssh://root@$(hw6_fqdn "$1")/system"
 }
 
 hw6_ensure_config() {
@@ -171,10 +178,30 @@ hw6_ensure_config_from_nfs() {
     return 1
 }
 
-# Replace or inject managed /etc/hosts block (idempotent)
+hw6_fqdn() {
+    echo "${1}.${HW6_HOST_DOMAIN}"
+}
+
+# 127.0.0.1 must not map the cluster hostname (breaks live migration on libvirt 9+)
+hw6_fix_loopback_hosts() {
+    local hf="/etc/hosts"
+    if grep -q '^127\.0\.0\.1' "$hf"; then
+        sed -i 's/^127\.0\.0\.1.*/127.0.0.1   localhost localhost.localdomain localhost4/' "$hf"
+    else
+        echo '127.0.0.1   localhost localhost.localdomain localhost4' >> "$hf"
+    fi
+    if grep -q '^::1' "$hf"; then
+        sed -i 's/^::1.*/::1         localhost localhost.localdomain localhost6/' "$hf"
+    else
+        echo '::1         localhost localhost.localdomain localhost6' >> "$hf"
+    fi
+}
+
+# Replace or inject managed /etc/hosts block (idempotent, with FQDN)
 hw6_hosts_inject() {
     local hf="/etc/hosts"
     local tmp
+    local domain="${HW6_HOST_DOMAIN}"
     tmp="$(mktemp)"
 
     if grep -qF "$HW6_HOSTS_MARK_BEGIN" "$hf" 2>/dev/null; then
@@ -191,15 +218,34 @@ hw6_hosts_inject() {
         cat "$tmp"
         echo ""
         echo "$HW6_HOSTS_MARK_BEGIN"
-        printf '%s\t%s\n' "$HOST_A_IP" "servera"
-        printf '%s\t%s\n' "$HOST_B_IP" "serverb"
-        printf '%s\t%s\n' "$HOST_C_IP" "serverc"
+        printf '%s\t%s %s\n' "$HOST_A_IP" "servera.${domain}" "servera"
+        printf '%s\t%s %s\n' "$HOST_B_IP" "serverb.${domain}" "serverb"
+        printf '%s\t%s %s\n' "$HOST_C_IP" "serverc.${domain}" "serverc"
         echo "$HW6_HOSTS_MARK_END"
     } > "${tmp}.new"
 
     install -m 644 "${tmp}.new" "$hf"
     rm -f "$tmp" "${tmp}.new"
-    ok_cb "/etc/hosts updated (servera, serverb, serverc)"
+    ok_cb "/etc/hosts updated (FQDN *.${domain})"
+}
+
+# Set this machine's hostname + cluster /etc/hosts (required for virsh migrate)
+hw6_configure_cluster_hostname() {
+    local short="$1"
+    local fqdn
+
+    case "$short" in
+        servera|serverb|serverc) ;;
+        *) warn_cb "Unknown host role: $short"; return 1 ;;
+    esac
+
+    fqdn="$(hw6_fqdn "$short")"
+    hostnamectl set-hostname "$fqdn" 2>/dev/null || echo "$fqdn" > /etc/hostname
+
+    hw6_fix_loopback_hosts
+    hw6_hosts_inject
+
+    ok_cb "Hostname: $(hostname -f) (migration FQDN)"
 }
 
 hw6_update_hosts_file() {

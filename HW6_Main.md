@@ -245,6 +245,19 @@ virsh migrate --live --persistent --undefinesource --unsafe \
 | 대시보드 호스트 빨강 | `cluster.conf` IP = 실제 NIC IP |
 | Migration storage 오류 | B/C에 `mount \| grep libvirt` 요청 |
 | `Unsafe migration` / shared storage | B/C NFS 마운트 확인 후 `--unsafe` 사용 (스크립트·대시보드 반영됨) |
+| `Unable to resolve … dclab` | B 호스트명이 `dclab` 등으로 남음 → `hostnamectl set-hostname serverb.hw6.local` |
+| `hostname … localhost` / FQDN | `127.0.0.1`에 호스트명 있으면 안 됨 → `setup_sub.sh` 재실행 또는 아래 수동 |
+
+**수동 수정 (B/C, git pull 후에도 migration 실패 시):**
+
+```bash
+# Host-B 예시
+sudo hostnamectl set-hostname serverb.hw6.local
+sudo sed -i 's/^127.0.0.1.*/127.0.0.1   localhost localhost.localdomain localhost4/' /etc/hosts
+# /etc/hosts HW6 블록에 192.168.0.11  serverb.hw6.local serverb 있는지 확인
+hostname -f    # serverb.hw6.local 이어야 함
+getent hosts $(hostname -f)   # 127.0.0.1 이 아니어야 함
+```
 | NFS 문제 | `systemctl status nfs-server`, `exportfs -v` |
 
 환경 변수: `HW6_SKIP_SSH_WAIT=1`, `HW6_ROOT_PASSWORD=...` (3대 동일 root PW 시)

@@ -62,9 +62,9 @@ echo "  Host-A (NFS)  : ${HOST_A_IP}"
 echo "  NFS mount     : ${NFS_DIR}"
 echo ""
 
-# ── [1] /etc/hosts ────────────────────────────────────────────────────────────
-step 1 "Configure /etc/hosts"
-hw6_hosts_inject
+# ── [1] Hostname + /etc/hosts (FQDN for live migration) ───────────────────────
+step 1 "Configure hostname and /etc/hosts"
+hw6_configure_cluster_hostname "$THIS_HOSTNAME"
 
 # ── [2] System update + OpenSSH ───────────────────────────────────────────────
 step 2 "System update and OpenSSH"

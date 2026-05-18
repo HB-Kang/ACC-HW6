@@ -176,6 +176,19 @@ virsh -c qemu+ssh://root@servera/system list --all
 
 VirtualBox: Nested VT `VBoxManage modifyvm "이름" --nested-hw-virt on`, 어댑터 **브리지**.
 
+### Migration hostname 오류
+
+| 메시지 | 원인 |
+|--------|------|
+| `Unable to resolve 'dclab'` | PC 호스트명이 `dclab` — 다른 노드가 못 찾음 |
+| `resolved to localhost` | `/etc/hosts`에 `127.0.0.1 … serverc` 형태 |
+
+```bash
+cd ~/ACC-HW6 && git pull
+sudo bash setup_sub.sh    # serverb 또는 serverc FQDN 자동 설정
+hostname -f                 # serverb.hw6.local 또는 serverc.hw6.local
+```
+
 ---
 
 **A 쪽 설치·실험 전체**는 [HW6_Main.md](HW6_Main.md)만 보면 됩니다.

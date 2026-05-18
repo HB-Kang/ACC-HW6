@@ -179,11 +179,11 @@ if [[ "$do_place" -eq 1 ]]; then
         warn "NFS may not be mounted on this host — migration needs shared ${IMAGES_DIR}"
     for vm in vm-3 vm-4; do
         info "  $vm → Host-B (serverb)..."
-        hw6_virsh_migrate_live "$vm" qemu+ssh://root@serverb/system && ok "$vm → Host-B done"
+        hw6_virsh_migrate_live "$vm" "$(hw6_migrate_dest_uri serverb)" && ok "$vm → Host-B done"
     done
     for vm in vm-5 vm-6; do
         info "  $vm → Host-C (serverc)..."
-        hw6_virsh_migrate_live "$vm" qemu+ssh://root@serverc/system && ok "$vm → Host-C done"
+        hw6_virsh_migrate_live "$vm" "$(hw6_migrate_dest_uri serverc)" && ok "$vm → Host-C done"
     done
 fi
 
