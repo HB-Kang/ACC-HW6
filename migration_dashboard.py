@@ -69,7 +69,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from rich.columns import Columns
+from rich.live import Live
+from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -89,9 +90,13 @@ HW6_CONFIG_PATHS = (
 HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
-UI_REFRESH_SEC   = 1.0   # screen redraw (plain SSH terminal)
-LOG_MAX_LINES    = 8     # max log lines displayed
-VM_LINES_PER_HOST = 4    # keep host panels short on 80x24 SSH
+UI_REFRESH_SEC   = 1.0   # keyboard poll interval
+# Fixed SSH terminal layout (user terminal 209×41)
+TERM_COLS = 209
+TERM_ROWS = 41
+LOG_MAX_LINES     = 9
+VM_LINES_PER_HOST = 6
+HOST_BAR_WIDTH    = 36
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -613,11 +618,10 @@ def execute_migrations():
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Native terminal size — works reliably over SSH (no forced width/height / alt-screen)
-console = Console()
+console = Console(width=TERM_COLS, height=TERM_ROWS, force_terminal=True)
 
 
-def _make_bar(pct: float, width: int = 14, color: str = "blue") -> Text:
+def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> Text:
     """Build a text progress bar."""
     pct   = max(0.0, min(100.0, pct))
     fill  = int(pct / 100 * width)
@@ -641,9 +645,9 @@ def _render_host_panel(hs: HostState) -> Panel:
     has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
 
     grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=4)
-    grid.add_column(width=12)
-    grid.add_column(width=9, justify="right")
+    grid.add_column(width=6)
+    grid.add_column(width=HOST_BAR_WIDTH + 2)
+    grid.add_column(width=16, justify="right")
 
     def pct_style(pct: float, base: str) -> str:
         return f"bold {'red' if pct >= 90 else ('yellow' if pct >= 70 else base)}"
@@ -651,34 +655,34 @@ def _render_host_panel(hs: HostState) -> Panel:
     if has_host:
         grid.add_row(
             Text("CPU▲", style="bold white"),
-            _make_bar(cpu_host, 12, color),
+            _make_bar(cpu_host, HOST_BAR_WIDTH, color),
             Text(f"{cpu_host:.0f}% host", style=pct_style(cpu_host, color)),
         )
         grid.add_row(
             Text("CPU◇", style="dim"),
-            _make_bar(cpu_alloc_pct, 12, "dim"),
+            _make_bar(cpu_alloc_pct, HOST_BAR_WIDTH, "dim"),
             Text(f"{cpu_alloc_pct:.0f}% alloc", style="dim"),
         )
         mem_label = f"{hs.mem_used_mb}/{hs.mem_total_mb}M"
         grid.add_row(
             Text("MEM▲", style="bold white"),
-            _make_bar(mem_host, 12, color),
+            _make_bar(mem_host, HOST_BAR_WIDTH, color),
             Text(f"{mem_host:.0f}% {mem_label}", style=pct_style(mem_host, color)),
         )
         grid.add_row(
             Text("MEM◇", style="dim"),
-            _make_bar(mem_alloc_pct, 12, "dim"),
+            _make_bar(mem_alloc_pct, HOST_BAR_WIDTH, "dim"),
             Text(f"{mem_alloc_pct:.0f}% alloc", style="dim"),
         )
     else:
         grid.add_row(
             Text("CPU", style="dim"),
-            _make_bar(cpu_alloc_pct, 12, color),
+            _make_bar(cpu_alloc_pct, HOST_BAR_WIDTH, color),
             Text(f"{cpu_alloc_pct:.0f}% alloc", style=pct_style(cpu_alloc_pct, color)),
         )
         grid.add_row(
             Text("MEM", style="dim"),
-            _make_bar(mem_alloc_pct, 12, color),
+            _make_bar(mem_alloc_pct, HOST_BAR_WIDTH, color),
             Text(f"{mem_alloc_pct:.0f}% alloc", style=pct_style(mem_alloc_pct, color)),
         )
 
@@ -742,7 +746,7 @@ def _render_status_panel() -> Panel:
         mb_proc  = mig.data_proc_b  / 1024 / 1024
         mb_total = mig.data_total_b / 1024 / 1024
 
-        bar_w = 38
+        bar_w = min(120, TERM_COLS - 70)
         fill  = int(pct / 100 * bar_w)
         bar   = Text()
         bar.append("█" * fill,          style="bold blue")
@@ -849,9 +853,9 @@ def _render_log_panel() -> Panel:
         "BPK": "bold cyan",
     }
     grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=9, style="dim")
+    grid.add_column(width=10, style="dim")
     grid.add_column(width=6)
-    grid.add_column()
+    grid.add_column(width=TERM_COLS - 28)
 
     with _lock:
         lines = list(log_lines[-LOG_MAX_LINES:])
@@ -865,49 +869,59 @@ def _render_log_panel() -> Panel:
     return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
 
 
-def _footer_text() -> Text:
-    footer = Text(justify="center")
-    for key, desc in (
-        ("[r]", "BinPack"),
-        ("[c]", "Consolidate"),
-        ("[l]", "LoadBal"),
-        ("[m]", "Migrate"),
-        ("[q]", "Quit"),
-    ):
-        footer.append(key, style="bold yellow")
-        footer.append(f" {desc}  ", style="dim")
-    footer.append(time.strftime("%H:%M:%S"), style="dim")
-    return footer
+def _build_layout() -> Layout:
+    """Rows sum to 40 (+1 margin) inside TERM_ROWS=41."""
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="hosts", size=16),
+        Layout(name="status", size=9),
+        Layout(name="log", size=11),
+        Layout(name="footer", size=1),
+    )
+    layout["hosts"].split_row(
+        Layout(name="host_a"),
+        Layout(name="host_b"),
+        Layout(name="host_c"),
+    )
+    return layout
 
 
-def _draw_dashboard() -> None:
-    """Full-screen redraw for normal SSH terminals (one section per line)."""
-    console.clear(home=True)
-
-    console.print(Panel(
-        Align.center(Text("HW6 Live Migration Dashboard", style="bold cyan")),
-        box=box.HEAVY_HEAD,
+def _render(layout: Layout) -> None:
+    layout["header"].update(Panel(
+        Align.center(Text(
+            "HW6 Live Migration Dashboard  ·  2D Bin Packing",
+            style="bold cyan",
+        )),
         border_style="blue",
+        box=box.HEAVY_HEAD,
     ))
 
     with _lock:
         host_states = dict(hosts)
 
-    console.print(Columns(
-        [
-            _render_host_panel(host_states.get(
-                "Host-A", HostState("Host-A", "", 8, 16384, reachable=False))),
-            _render_host_panel(host_states.get(
-                "Host-B", HostState("Host-B", "", 8, 16384, reachable=False))),
-            _render_host_panel(host_states.get(
-                "Host-C", HostState("Host-C", "", 8, 16384, reachable=False))),
-        ],
-        expand=True,
-        equal=True,
-    ))
-    console.print(_render_status_panel())
-    console.print(_render_log_panel())
-    console.print(Align.center(_footer_text()))
+    layout["host_a"].update(_render_host_panel(
+        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False))))
+    layout["host_b"].update(_render_host_panel(
+        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False))))
+    layout["host_c"].update(_render_host_panel(
+        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False))))
+
+    layout["status"].update(_render_status_panel())
+    layout["log"].update(_render_log_panel())
+
+    footer = Text(justify="center")
+    for key, desc in (
+        ("[r]", "Spread BinPack"),
+        ("[c]", "Consolidate (C idle)"),
+        ("[l]", "Load balance"),
+        ("[m]", "Run migration"),
+        ("[q]", "Quit"),
+    ):
+        footer.append(key, style="bold yellow")
+        footer.append(f" {desc}   ", style="dim")
+    footer.append(time.strftime("%H:%M:%S"), style="dim")
+    layout["footer"].update(Align.center(footer))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Key handling
@@ -1011,10 +1025,11 @@ def main():
 
     _init_hosts()
 
-    tw, th = shutil.get_terminal_size(fallback=(100, 30))
-    if tw < 100 or th < 28:
+    tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
+    if tw != TERM_COLS or th != TERM_ROWS:
         console.print(
-            f"[yellow]Tip: terminal {tw}x{th} — enlarge SSH window (~100x30+ recommended)[/yellow]"
+            f"[dim]Layout {TERM_COLS}x{TERM_ROWS} — your terminal is {tw}x{th} "
+            f"(resize SSH window to match for best fit)[/dim]"
         )
 
     log("OK",  "Dashboard started")
@@ -1026,22 +1041,30 @@ def main():
     upd = threading.Thread(target=_update_loop, daemon=True)
     upd.start()
 
-    # Raw mode for single-key input; plain clear+print each second (SSH-safe)
+    layout = _build_layout()
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        while running:
-            _draw_dashboard()
-            if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
-                key = sys.stdin.read(1)
-                if key in ("q", "\x03"):   # q or Ctrl+C
-                    running = False
-                    break
-                _handle_key(key)
+        with Live(
+            layout,
+            console=console,
+            screen=True,
+            transient=True,
+            auto_refresh=False,
+            refresh_per_second=1,
+        ) as live:
+            while running:
+                _render(layout)
+                live.refresh()
+                if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
+                    key = sys.stdin.read(1)
+                    if key in ("q", "\x03"):
+                        running = False
+                        break
+                    _handle_key(key)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        console.clear(home=True)
-        console.print("[dim]Dashboard exited.[/dim]")
+        console.print("\n[dim]Dashboard exited.[/dim]")
 
 
 if __name__ == "__main__":

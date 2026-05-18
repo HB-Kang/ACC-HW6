@@ -174,7 +174,7 @@ python3 migration_dashboard.py
 
 (`/etc/hw6/cluster.conf` IP 자동 사용)
 
-**SSH 터미널:** 일반 clear+출력 방식 (PuTTY, Windows Terminal, `ssh` 모두 호환). 창 크기 **가로 100 · 세로 30** 이상 권장.
+**SSH 터미널:** UI는 **209×41** 에 맞춤 (PuTTY 등에서 열·행을 209×41로 설정하면 가장 잘 맞음).
 
 | 키 | 동작 | Case |
 |----|------|------|
