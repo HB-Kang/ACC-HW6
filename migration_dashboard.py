@@ -526,6 +526,8 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
 
     src_ip = HOSTS_CONFIG[src_host]["ip"]
     dst_ip = HOSTS_CONFIG[dst_host]["ip"]
+    dst_fqdn = HOSTS_CONFIG[dst_host]["fqdn"]
+    mig_uri = f"tcp://{dst_ip}:0"
 
     with _lock:
         active_mig    = MigrationJob(vm_name=vm_name,
@@ -535,13 +537,20 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
 
     log("MIG", f"{vm_name}: {src_host} → {dst_host} migration started")
 
-    # --unsafe: NFS-backed disks at the same path; libvirt 9+ may not auto-detect shared storage
-    result = subprocess.run(
-        ["virsh", "-c", f"qemu+ssh://root@{src_ip}/system",
-         "migrate", "--live", "--persistent", "--undefinesource", "--unsafe",
-         vm_name, f"qemu+ssh://root@{dst_ip}/system"],
-        capture_output=True, text=True, timeout=600
-    )
+    # --unsafe: NFS shared disk; --migrateuri: data channel to cluster IP (fixes C-only I/O errors)
+    base_cmd = [
+        "virsh", "-c", f"qemu+ssh://root@{src_ip}/system",
+        "migrate", "--live", "--persistent", "--undefinesource", "--unsafe",
+        "--migrateuri", mig_uri,
+        vm_name, f"qemu+ssh://root@{dst_fqdn}/system",
+    ]
+    result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        log("MIG", f"{vm_name}: retry with --tunnelled")
+        result = subprocess.run(
+            base_cmd[:-2] + ["--tunnelled", vm_name, base_cmd[-1]],
+            capture_output=True, text=True, timeout=600,
+        )
 
     with _lock:
         mig = active_mig
@@ -963,11 +972,24 @@ def load_hosts_config() -> Dict[str, dict]:
     cpu_cap = int(raw.get("CPU_CAP", "8"))
     mem_cap = int(raw.get("MEM_CAP_MB", "16384"))
 
-    return {
-        "Host-A": {"ip": raw["HOST_A_IP"], "cpu_cap": cpu_cap, "mem_cap_mb": mem_cap},
-        "Host-B": {"ip": raw["HOST_B_IP"], "cpu_cap": cpu_cap, "mem_cap_mb": mem_cap},
-        "Host-C": {"ip": raw["HOST_C_IP"], "cpu_cap": cpu_cap, "mem_cap_mb": mem_cap},
-    }
+    domain = raw.get("HOST_DOMAIN", "hw6.local")
+    short = {"Host-A": "servera", "Host-B": "serverb", "Host-C": "serverc"}
+    hosts_cfg = {}
+    for h_name, ip_key in (
+        ("Host-A", "HOST_A_IP"),
+        ("Host-B", "HOST_B_IP"),
+        ("Host-C", "HOST_C_IP"),
+    ):
+        s = short[h_name]
+        ip = raw[ip_key]
+        hosts_cfg[h_name] = {
+            "ip": ip,
+            "short": s,
+            "fqdn": f"{s}.{domain}",
+            "cpu_cap": cpu_cap,
+            "mem_cap_mb": mem_cap,
+        }
+    return hosts_cfg
 
 
 # ══════════════════════════════════════════════════════════════════════════════

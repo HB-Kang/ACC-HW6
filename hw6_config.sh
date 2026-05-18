@@ -182,6 +182,32 @@ hw6_fqdn() {
     echo "${1}.${HW6_HOST_DOMAIN}"
 }
 
+hw6_cluster_ip_for_short() {
+    case "$1" in
+        servera) echo "$HOST_A_IP" ;;
+        serverb) echo "$HOST_B_IP" ;;
+        serverc) echo "$HOST_C_IP" ;;
+        *) return 1 ;;
+    esac
+}
+
+# QEMU advertises this address for incoming migration (avoids wrong NIC / localhost on C)
+hw6_configure_libvirt_migration() {
+    local ip="$1"
+    local qconf="/etc/libvirt/qemu.conf"
+
+    [[ -f "$qconf" ]] || { warn_cb "qemu.conf missing — skip migration_host"; return 0; }
+
+    if grep -qE '^#?migration_host' "$qconf"; then
+        sed -i "s|^#\\?migration_host.*|migration_host = \"${ip}\"|" "$qconf"
+    else
+        printf '\nmigration_host = "%s"\n' "$ip" >> "$qconf"
+    fi
+
+    systemctl try-restart libvirtd 2>/dev/null || systemctl restart libvirtd
+    ok_cb "libvirt migration_host=${ip}"
+}
+
 # 127.0.0.1 must not map the cluster hostname (breaks live migration on libvirt 9+)
 hw6_fix_loopback_hosts() {
     local hf="/etc/hosts"
@@ -244,6 +270,7 @@ hw6_configure_cluster_hostname() {
 
     hw6_fix_loopback_hosts
     hw6_hosts_inject
+    hw6_configure_libvirt_migration "$(hw6_cluster_ip_for_short "$short")"
 
     ok_cb "Hostname: $(hostname -f) (migration FQDN)"
 }
@@ -342,13 +369,60 @@ hw6_make_cidata_iso() {
     return 1
 }
 
+# Remote checks before migrate (NFS + libvirtd + FQDN not localhost)
+hw6_migration_preflight() {
+    local short="$1"
+    local fqdn ip path rc
+    fqdn="$(hw6_fqdn "$short")"
+    ip="$(hw6_cluster_ip_for_short "$short")"
+    path="$HW6_NFS_DIR"
+
+    if ! hw6_ssh_test_host "$short"; then
+        warn_cb "SSH to ${short} (${fqdn}) failed — run setup_sub on B/C"
+        return 1
+    fi
+
+    rc=0
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${short}" bash -s -- "$path" "$ip" <<'EOS' || rc=$?
+path="$1"
+want_ip="$2"
+systemctl is-active --quiet libvirtd || { echo "libvirtd not active"; exit 1; }
+mount | grep -q " on ${path} " || mount | grep -q "${path}" || { echo "NFS not mounted at ${path}"; exit 1; }
+test -w "${path}" || { echo "NFS path not writable: ${path}"; exit 1; }
+resolved="$(getent hosts "$(hostname -f)" | awk '{print $1}' | head -1)"
+[[ -n "$resolved" && "$resolved" != "127.0.0.1" ]] || { echo "hostname -f resolves to localhost"; exit 1; }
+EOS
+
+    if [[ $rc -ne 0 ]]; then
+        warn_cb "Preflight ${short} failed (NFS/libvirtd/FQDN) — fix Host-${short^^} then retry"
+        return 1
+    fi
+    ok_cb "Preflight OK: ${short} (${ip})"
+    return 0
+}
+
 # Live migration (NFS shared qcow2 at /var/lib/libvirt/images on all hosts).
 # libvirt 9+ may not treat NFS file disks as "shared" — --unsafe is required for this lab.
+# dest_short: serverb|serverc — sets --migrateuri tcp://<cluster-ip>:0 for the data channel.
 hw6_virsh_migrate_live() {
     local vm_name="$1"
     local dest_uri="$2"
-    virsh migrate --live --persistent --undefinesource --unsafe \
-        "$vm_name" "$dest_uri"
+    local dest_short="${3:-}"
+    local dest_ip=""
+    local base=(--live --persistent --undefinesource --unsafe)
+    local miguri=()
+
+    if [[ -n "$dest_short" ]]; then
+        dest_ip="$(hw6_cluster_ip_for_short "$dest_short")" || true
+    fi
+    [[ -n "$dest_ip" ]] && miguri=(--migrateuri "tcp://${dest_ip}:0")
+
+    if virsh migrate "${base[@]}" "${miguri[@]}" "$vm_name" "$dest_uri"; then
+        return 0
+    fi
+
+    warn_cb "${vm_name}: retry migration with --tunnelled"
+    virsh migrate "${base[@]}" "${miguri[@]}" --tunnelled "$vm_name" "$dest_uri"
 }
 
 hw6_check_nfs_shared_storage() {
@@ -379,7 +453,7 @@ hw6_ssh_client_config() {
 
     cat > "$dropin" << EOF
 # HW6 cluster SSH client defaults
-Host servera serverb serverc ${HOST_A_IP} ${HOST_B_IP} ${HOST_C_IP}
+Host servera serverb serverc servera.${HW6_HOST_DOMAIN} serverb.${HW6_HOST_DOMAIN} serverc.${HW6_HOST_DOMAIN} ${HOST_A_IP} ${HOST_B_IP} ${HOST_C_IP}
     User root
     StrictHostKeyChecking accept-new
     UserKnownHostsFile ${HW6_SSH_KNOWN_HOSTS}

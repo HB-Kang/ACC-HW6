@@ -247,6 +247,7 @@ virsh migrate --live --persistent --undefinesource --unsafe \
 | `Unsafe migration` / shared storage | B/C NFS 마운트 확인 후 `--unsafe` 사용 (스크립트·대시보드 반영됨) |
 | `Unable to resolve … dclab` | B 호스트명이 `dclab` 등으로 남음 → `hostnamectl set-hostname serverb.hw6.local` |
 | `hostname … localhost` / FQDN | `127.0.0.1`에 호스트명 있으면 안 됨 → `setup_sub.sh` 재실행 또는 아래 수동 |
+| C만 `channel … I/O error` | C NFS 미마운트·FQDN·`migration_host` → **Host-C** `setup_sub.sh` 후 A에서 재시도 |
 
 **수동 수정 (B/C, git pull 후에도 migration 실패 시):**
 

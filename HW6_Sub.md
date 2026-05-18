@@ -189,6 +189,27 @@ sudo bash setup_sub.sh    # serverb 또는 serverc FQDN 자동 설정
 hostname -f                 # serverb.hw6.local 또는 serverc.hw6.local
 ```
 
+### C만 `channel error: Input/output error` (B는 됨)
+
+| 확인 (Host-C에서) | 기대 |
+|-------------------|------|
+| `mount \| grep libvirt` | NFS 마운트 있음 |
+| `df -h /var/lib/libvirt/images` | Host-A export, **쓰기 가능** |
+| `hostname -f` | `serverc.hw6.local` |
+| `getent hosts $(hostname -f)` | **127.0.0.1 아님**, C의 LAN IP |
+| `grep migration_host /etc/libvirt/qemu.conf` | `migration_host = "<C IP>"` |
+
+```bash
+# Host-C
+sudo bash setup_sub.sh          # NFS + FQDN + migration_host 재적용
+sudo systemctl restart libvirtd
+
+# Host-A에서 점검
+ssh root@serverc 'mount | grep libvirt; hostname -f; virsh version'
+virsh migrate --live --unsafe --migrateuri tcp://<C_IP>:0 \
+  vm-5 qemu+ssh://root@serverc.hw6.local/system
+```
+
 ---
 
 **A 쪽 설치·실험 전체**는 [HW6_Main.md](HW6_Main.md)만 보면 됩니다.
