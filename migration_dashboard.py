@@ -90,14 +90,14 @@ HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 UI_REFRESH_SEC   = 1.0   # keyboard poll interval
-# SSH terminal 209×41 target — 2-column UI: hosts (left) | status+log (right)
-TERM_COLS = 209
-TERM_ROWS = 41
-TERM_MARGIN = 2   # last columns empty — column 209 wrap adds a ghost line (Xshell)
+# SSH terminal 269×48 target — 2-column UI: hosts (left) | status+log (right)
+TERM_COLS = 269
+TERM_ROWS = 48
+TERM_MARGIN = 2   # last columns empty — wrap at column N adds a ghost line (Xshell)
 ROW_MARGIN = 2    # never fill to physical bottom row
-LOG_MAX_LINES = 12
-VM_LINES_PER_HOST = 3
-HOST_BAR_WIDTH = 22
+LOG_MAX_LINES = 24
+VM_LINES_PER_HOST = 6
+HOST_BAR_WIDTH = 60     # default; overridden each frame from actual panel width
 
 # Filled in main() from actual terminal size
 _ui: Dict[str, int] = {}
@@ -625,26 +625,42 @@ def execute_migrations():
 console = Console(width=TERM_COLS - TERM_MARGIN, force_terminal=True)
 
 
-def _layout_sizes(term_rows: int) -> Dict[str, int]:
-    """Partition rows so header+main+footer never exceeds terminal (prevents 1-line scroll bump)."""
+def _layout_sizes(term_rows: int, term_cols: int) -> Dict[str, int]:
+    """Partition rows/columns so header+main+footer never exceeds terminal."""
     total = max(24, term_rows - ROW_MARGIN)
     header, footer = 3, 1
     main = total - header - footer
-    host_h = max(7, main // 3)
+
+    host_h = max(8, main // 3)
     while host_h * 3 > main:
         host_h -= 1
-    status_h = max(6, main // 3)
-    log_h = max(4, main - status_h)
-    if status_h + log_h > main:
+    leftover = main - host_h * 3   # extend last host to fill main rows
+
+    status_h = max(8, min(16, main // 3))
+    log_h = main - status_h
+    if log_h < 6:
+        log_h = 6
         status_h = max(6, main - log_h)
+
+    safe_w = max(80, term_cols - TERM_MARGIN)
+    left_w = safe_w // 2
+    right_w = safe_w - left_w
+    panel_inner = max(20, left_w - 4)        # left column inner (after panel borders/padding)
+    bar_w = max(20, panel_inner - 5 - 11 - 4)  # label + bar + pct columns
+
     return {
         "total": total,
         "header": header,
         "main": main,
         "footer": footer,
         "host_h": host_h,
+        "host_h_last": host_h + leftover,
         "status_h": status_h,
         "log_h": log_h,
+        "safe_w": safe_w,
+        "left_w": left_w,
+        "right_w": right_w,
+        "bar_w": bar_w,
     }
 
 
@@ -704,10 +720,12 @@ def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> T
 def _render_host_panel(
     hs: HostState,
     *,
-    bar_width: int = HOST_BAR_WIDTH,
+    bar_width: Optional[int] = None,
     vm_max: int = VM_LINES_PER_HOST,
     panel_height: Optional[int] = None,
 ) -> Panel:
+    if bar_width is None:
+        bar_width = _ui.get("bar_w", HOST_BAR_WIDTH)
     color = HOST_COLORS.get(hs.name, "white")
 
     alloc_cpu = sum(v.cpu    for v in hs.vms if v.state == "running")
@@ -791,7 +809,7 @@ def _render_host_panel(
                 icon, ic = "○", "dim"
                 label = vm.state[:9]
 
-            vlabel = f"{vm.name[:8]:8} {vm.cpu}c/{vm.mem_mb // 1024}G"
+            vlabel = f"{vm.name[:12]:<12}  {vm.cpu}c / {vm.mem_mb // 1024}G"
             grid.add_row(
                 Text(icon, style=ic),
                 Text(vlabel, style="white"),
@@ -837,7 +855,7 @@ def _render_status_panel(*, panel_height: Optional[int] = None) -> Panel:
         mb_proc  = mig.data_proc_b  / 1024 / 1024
         mb_total = mig.data_total_b / 1024 / 1024
 
-        bar_w = min(48, _ui.get("width", TERM_COLS) // 2 - 28)
+        bar_w = max(20, _ui.get("right_w", TERM_COLS // 2) - 32)
         fill  = int(pct / 100 * bar_w)
         bar   = Text()
         bar.append("#" * fill, style="bold blue")
@@ -948,10 +966,10 @@ def _render_log_panel(*, panel_height: Optional[int] = None) -> Panel:
     with _lock:
         lines = list(log_lines[-log_n:])
 
-    msg_w = max(40, _ui.get("width", TERM_COLS) // 2 - 22)
+    msg_w = max(40, _ui.get("right_w", TERM_COLS // 2) - 22)
     for ts, lvl, msg in lines:
         if len(msg) > msg_w:
-            msg = msg[: msg_w - 1] + "…"
+            msg = msg[: msg_w - 3] + "..."
         grid.add_row(
             ts,
             Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
@@ -975,7 +993,7 @@ def _build_layout(sizes: Dict[str, int]) -> Layout:
     layout["hosts_col"].split_column(
         Layout(name="host_a", size=sizes["host_h"]),
         Layout(name="host_b", size=sizes["host_h"]),
-        Layout(name="host_c", size=sizes["host_h"]),
+        Layout(name="host_c", size=sizes["host_h_last"]),
     )
     layout["info_col"].split_column(
         Layout(name="status", size=sizes["status_h"]),
@@ -998,17 +1016,17 @@ def _render(layout: Layout, sizes: Dict[str, int]) -> None:
     with _lock:
         host_states = dict(hosts)
 
-    narrow = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
-    ph = sizes["host_h"]
+    narrow = dict(bar_width=sizes.get("bar_w", HOST_BAR_WIDTH),
+                  vm_max=VM_LINES_PER_HOST)
     layout["host_a"].update(_render_host_panel(
         host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False)),
-        panel_height=ph, **narrow))
+        panel_height=sizes["host_h"], **narrow))
     layout["host_b"].update(_render_host_panel(
         host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False)),
-        panel_height=ph, **narrow))
+        panel_height=sizes["host_h"], **narrow))
     layout["host_c"].update(_render_host_panel(
         host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False)),
-        panel_height=ph, **narrow))
+        panel_height=sizes["host_h_last"], **narrow))
 
     layout["status"].update(_render_status_panel(panel_height=sizes["status_h"]))
     layout["log"].update(_render_log_panel(panel_height=sizes["log_h"]))
@@ -1121,8 +1139,10 @@ def main():
     _init_hosts()
 
     tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
-    safe_w = min(tw, TERM_COLS) - TERM_MARGIN
-    sizes = _layout_sizes(th)
+    use_w = min(tw, TERM_COLS)
+    use_h = min(th, TERM_ROWS)
+    sizes = _layout_sizes(use_h, use_w)
+    safe_w = sizes["safe_w"]
     _ui = {"width": safe_w, "height": sizes["total"], **sizes}
     console = Console(width=safe_w, height=sizes["total"], force_terminal=True)
 
