@@ -18,9 +18,18 @@ HW6_MEM_CAP_MB="${HW6_MEM_CAP_MB:-16384}"
 HW6_HOST_DOMAIN="${HW6_HOST_DOMAIN:-hw6.local}"
 # cloud-init ISOs stay off NFS — avoids "Resource temporarily unavailable" when B/C hold locks
 HW6_CLOUD_INIT_DIR="${HW6_CLOUD_INIT_DIR:-/var/tmp/hw6-cloud-init}"
-# Same CPU model on A/B/C — host-passthrough breaks live migration (special registers / I/O error)
+# Same CPU on A/B/C — host-model breaks migration; Intel cluster must not require AMD SVM
 HW6_VM_CPU_MODEL="${HW6_VM_CPU_MODEL:-qemu64}"
+# Disable AMD-V (svm): all hosts are Intel i7 — "Host CPU does not provide svm" on Host-C otherwise
+HW6_VM_CPU_FLAGS="${HW6_VM_CPU_FLAGS:--svm}"
 HW6_VM_MACHINE="${HW6_VM_MACHINE:-q35}"
+
+# virt-install / virt-xml CPU string, e.g. qemu64,-svm
+hw6_vm_cpu_spec() {
+    local spec="${HW6_VM_CPU_MODEL}"
+    [[ -n "${HW6_VM_CPU_FLAGS}" ]] && spec="${spec},${HW6_VM_CPU_FLAGS}"
+    echo "$spec"
+}
 HW6_HOSTS_MARK_BEGIN="# BEGIN HW6 CLUSTER"
 HW6_HOSTS_MARK_END="# END HW6 CLUSTER"
 HW6_CLUSTER_HOSTS=(servera serverb serverc)
@@ -545,14 +554,14 @@ hw6_virsh_set_cpu_migratable() {
     fi
 
     if command -v virt-xml &>/dev/null; then
-        if virt-xml "$vm" --edit --cpu "${HW6_VM_CPU_MODEL}" --confirm >/dev/null 2>&1; then
-            ok_cb "${vm}: CPU model → ${HW6_VM_CPU_MODEL} (migratable)"
+        if virt-xml "$vm" --edit --cpu "$(hw6_vm_cpu_spec)" --confirm >/dev/null 2>&1; then
+            ok_cb "${vm}: CPU → $(hw6_vm_cpu_spec) (Intel migratable)"
             [[ "$was_running" -eq 1 ]] && virsh start "$vm" >/dev/null 2>&1
             return 0
         fi
     fi
 
-    warn_cb "${vm}: install virt-install (virt-xml) or recreate VM with --cpu ${HW6_VM_CPU_MODEL}"
+    warn_cb "${vm}: install virt-install (virt-xml) or recreate with --cpu $(hw6_vm_cpu_spec)"
     [[ "$was_running" -eq 1 ]] && virsh start "$vm" >/dev/null 2>&1
     return 1
 }
@@ -560,10 +569,11 @@ hw6_virsh_set_cpu_migratable() {
 hw6_ssh_set_cpu_migratable() {
     local host="$1"
     local vm="$2"
-    local model="${HW6_VM_CPU_MODEL}"
+    local spec
+    spec="$(hw6_vm_cpu_spec)"
 
     hw6_ssh_test_host "$host" || return 1
-    ssh -o BatchMode=yes "root@${host}" bash -s -- "$vm" "$model" <<'EOS'
+    ssh -o BatchMode=yes "root@${host}" bash -s -- "$vm" "$spec" <<'EOS'
 vm="$1"
 model="$2"
 virsh dominfo "$vm" &>/dev/null || exit 0

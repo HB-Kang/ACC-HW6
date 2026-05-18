@@ -231,7 +231,9 @@ sudo bash hw6_diag_migration.sh    # Host-A에서 실행
 
 ### Rocky 10 — `special registers: Invalid argument` / C만 migration 실패
 
-**원인:** VM CPU가 **Host-A의 host-model** 이면 Host-C(다른 CPU·nested VM)로 라이브 마이그레이션 시 QEMU가 레지스터 복원에 실패합니다. B는 되고 C만 안 되는 전형적인 패턴입니다.
+**원인:** VM CPU가 **Host-A의 host-model** 이면 Host-C(구형 i7·nested VM)로 마이그레이션 시 레지스터 복원 실패. B는 되고 C만 안 되는 패턴이 많습니다.
+
+**`Host CPU does not provide required features: svm`:** VM 정의에 **AMD SVM** 이 들어갔는데 호스트는 **Intel i7(VMX만 있음)**. A/B가 최신이면 host-model/기능 세트가 C에서 맞지 않을 수 있습니다.
 
 **처방 (A에서, VM 꺼진 뒤 적용해도 됨):**
 
@@ -242,7 +244,9 @@ sudo bash hw6_fix_vm_cpu.sh          # 기존 vm-1..6 CPU → qemu64
 sudo bash create_vms.sh
 ```
 
-새 VM은 `--cpu qemu64 --machine q35` 로 생성됩니다.
+새 VM은 `--cpu qemu64,-svm --machine q35` 로 생성됩니다 (Intel 전용).
+
+여전히 C에서 CPU 오류면 구형 i7에 맞춰: `export HW6_VM_CPU_MODEL=Penryn HW6_VM_CPU_FLAGS=` 후 `hw6_fix_vm_cpu.sh` 재실행.
 
 **Host-C가 VirtualBox/VMware 안의 Rocky면** Nested VT-x/AMD-V 필수. C에서 `egrep -c 'vmx|svm' /proc/cpuinfo` 가 0이면 KVM 호스트로 쓸 수 없습니다.
 
