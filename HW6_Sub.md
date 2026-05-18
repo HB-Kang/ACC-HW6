@@ -229,6 +229,25 @@ sudo bash hw6_diag_migration.sh    # Host-A에서 실행
 - `serverc.hw6.local` → **IPv4** (`192.168.0.x`) 로 풀려야 함 — `getent` 가 v6만 보이면 `setup_sub.sh` 재실행 (`/etc/gai.conf` IPv4 우선)
 - 진단에서 Host-A **NFS not mounted** 는 정상 (A는 NFS **서버**, export만 확인)
 
+### Rocky 10 — `special registers: Invalid argument` / C만 migration 실패
+
+**원인:** VM CPU가 **Host-A의 host-model** 이면 Host-C(다른 CPU·nested VM)로 라이브 마이그레이션 시 QEMU가 레지스터 복원에 실패합니다. B는 되고 C만 안 되는 전형적인 패턴입니다.
+
+**처방 (A에서, VM 꺼진 뒤 적용해도 됨):**
+
+```bash
+cd ~/ACC-HW6 && git pull
+sudo bash hw6_fix_vm_cpu.sh          # 기존 vm-1..6 CPU → qemu64
+# 또는 VM 다시 만들기
+sudo bash create_vms.sh
+```
+
+새 VM은 `--cpu qemu64 --machine q35` 로 생성됩니다.
+
+**Host-C가 VirtualBox/VMware 안의 Rocky면** Nested VT-x/AMD-V 필수. C에서 `egrep -c 'vmx|svm' /proc/cpuinfo` 가 0이면 KVM 호스트로 쓸 수 없습니다.
+
+**패키지 버전 (A/B/C 동일 권장):** `rpm -q qemu-kvm libvirt`
+
 ---
 
 **A 쪽 설치·실험 전체**는 [HW6_Main.md](HW6_Main.md)만 보면 됩니다.

@@ -250,6 +250,7 @@ virsh migrate --live --persistent --undefinesource --unsafe \
 | C만 `channel … I/O error` | C NFS 미마운트·FQDN·`migration_host` → **Host-C** `setup_sub.sh` 후 A에서 재시도 |
 | `cloud-init-vm-N.iso` Resource temporarily unavailable | NFS에 ISO + B/C에서 VM 실행 중 잠금 → `git pull` 후 `create_vms.sh` 재실행 (ISO는 `/var/tmp/hw6-cloud-init`) |
 | C만 QEMU monitor closed / argument unsupported | `sudo bash hw6_diag_migration.sh` → C 호스트명·NFS·nested KVM 확인 후 `setup_sub.sh` on C |
+| `special registers` / Invalid argument (C만) | CPU host-model 충돌 → `sudo bash hw6_fix_vm_cpu.sh` 후 재마이그레이션 (`--cpu qemu64`) |
 
 **수동 수정 (B/C, git pull 후에도 migration 실패 시):**
 

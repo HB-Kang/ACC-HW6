@@ -18,6 +18,9 @@ HW6_MEM_CAP_MB="${HW6_MEM_CAP_MB:-16384}"
 HW6_HOST_DOMAIN="${HW6_HOST_DOMAIN:-hw6.local}"
 # cloud-init ISOs stay off NFS — avoids "Resource temporarily unavailable" when B/C hold locks
 HW6_CLOUD_INIT_DIR="${HW6_CLOUD_INIT_DIR:-/var/tmp/hw6-cloud-init}"
+# Same CPU model on A/B/C — host-passthrough breaks live migration (special registers / I/O error)
+HW6_VM_CPU_MODEL="${HW6_VM_CPU_MODEL:-qemu64}"
+HW6_VM_MACHINE="${HW6_VM_MACHINE:-q35}"
 HW6_HOSTS_MARK_BEGIN="# BEGIN HW6 CLUSTER"
 HW6_HOSTS_MARK_END="# END HW6 CLUSTER"
 HW6_CLUSTER_HOSTS=(servera serverb serverc)
@@ -528,6 +531,76 @@ EOS
     return 0
 }
 
+# Rocky 10: host-model CPU on A vs different hardware on C → "Failed to set special registers"
+hw6_virsh_set_cpu_migratable() {
+    local vm="$1"
+    local was_running=0 state
+
+    virsh dominfo "$vm" &>/dev/null || return 0
+
+    state="$(virsh domstate "$vm" 2>/dev/null || echo "")"
+    if [[ "$state" == "running" ]]; then
+        was_running=1
+        virsh destroy "$vm" >/dev/null 2>&1 || return 1
+    fi
+
+    if command -v virt-xml &>/dev/null; then
+        if virt-xml "$vm" --edit --cpu "${HW6_VM_CPU_MODEL}" --confirm >/dev/null 2>&1; then
+            ok_cb "${vm}: CPU model → ${HW6_VM_CPU_MODEL} (migratable)"
+            [[ "$was_running" -eq 1 ]] && virsh start "$vm" >/dev/null 2>&1
+            return 0
+        fi
+    fi
+
+    warn_cb "${vm}: install virt-install (virt-xml) or recreate VM with --cpu ${HW6_VM_CPU_MODEL}"
+    [[ "$was_running" -eq 1 ]] && virsh start "$vm" >/dev/null 2>&1
+    return 1
+}
+
+hw6_ssh_set_cpu_migratable() {
+    local host="$1"
+    local vm="$2"
+    local model="${HW6_VM_CPU_MODEL}"
+
+    hw6_ssh_test_host "$host" || return 1
+    ssh -o BatchMode=yes "root@${host}" bash -s -- "$vm" "$model" <<'EOS'
+vm="$1"
+model="$2"
+virsh dominfo "$vm" &>/dev/null || exit 0
+state="$(virsh domstate "$vm" 2>/dev/null)"
+[[ "$state" == "running" ]] && virsh destroy "$vm" 2>/dev/null || true
+command -v virt-xml &>/dev/null || exit 1
+virt-xml "$vm" --edit --cpu "$model" --confirm
+[[ "$state" == "running" ]] && virsh start "$vm" 2>/dev/null || true
+EOS
+}
+
+# Set migratable CPU on whichever host currently defines the VM
+hw6_ensure_vm_cpu_migratable() {
+    local vm="$1"
+    local h
+
+    if virsh dominfo "$vm" &>/dev/null; then
+        hw6_virsh_set_cpu_migratable "$vm"
+        return $?
+    fi
+    for h in serverb serverc; do
+        if hw6_ssh_test_host "$h" && ssh -o BatchMode=yes "root@${h}" "virsh dominfo '${vm}'" &>/dev/null; then
+            hw6_ssh_set_cpu_migratable "$h" "$vm" && ok_cb "${vm}: CPU fixed on ${h}"
+            return 0
+        fi
+    done
+    warn_cb "${vm}: not defined on servera/b/c"
+    return 1
+}
+
+hw6_ensure_all_vms_cpu_migratable() {
+    local vm
+    for vm in vm-1 vm-2 vm-3 vm-4 vm-5 vm-6; do
+        hw6_ensure_vm_cpu_migratable "$vm" 2>/dev/null || true
+    done
+}
+
 # Live migration (NFS shared qcow2 at /var/lib/libvirt/images on all hosts).
 # libvirt 9+ may not treat NFS file disks as "shared" — --unsafe is required for this lab.
 # dest_short: serverb|serverc — sets --migrateuri tcp://<cluster-ip>:0 for the data channel.
@@ -546,6 +619,7 @@ hw6_virsh_migrate_live() {
 
     hw6_remote_repair_migration_target "$dest_short" || return 1
     hw6_migration_clear_dest_domain "$vm_name" "$dest_short"
+    hw6_ensure_vm_cpu_migratable "$vm_name" || warn_cb "${vm_name}: CPU may still be host-model — migration can fail on C"
 
     if ! virsh -c "$dest_uri" version &>/dev/null; then
         warn_cb "Cannot connect to ${dest_uri} — check SSH and libvirtd on ${dest_short}"

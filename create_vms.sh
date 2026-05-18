@@ -148,6 +148,8 @@ for vm in "${VM_NAMES[@]}"; do
         --name "$vm" \
         --vcpus "$cpu" \
         --memory "$mem" \
+        --cpu "${HW6_VM_CPU_MODEL}" \
+        --machine "${HW6_VM_MACHINE}" \
         --disk "path=${disk_path},format=qcow2,bus=virtio" \
         --disk "path=${iso_path},device=cdrom,readonly=on" \
         --import \
@@ -179,6 +181,9 @@ else
 fi
 
 if [[ "$do_place" -eq 1 ]]; then
+    info "Setting migratable CPU (${HW6_VM_CPU_MODEL}) on all VMs before live migration..."
+    hw6_ensure_all_vms_cpu_migratable
+
     hw6_check_nfs_shared_storage "$IMAGES_DIR" || \
         warn "NFS may not be mounted on this host — migration needs shared ${IMAGES_DIR}"
     hw6_migration_preflight serverb || warn "Host-B preflight failed — migration may fail"
