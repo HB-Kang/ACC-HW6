@@ -91,12 +91,12 @@ HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 UI_REFRESH_SEC   = 1.0   # keyboard poll interval
-# Fixed SSH terminal layout (user terminal 209×41)
+# SSH terminal 209×41 — 2-column UI: hosts (left) | status+log (right)
 TERM_COLS = 209
 TERM_ROWS = 41
-LOG_MAX_LINES     = 9
-VM_LINES_PER_HOST = 6
-HOST_BAR_WIDTH    = 36
+LOG_MAX_LINES      = 12
+VM_LINES_PER_HOST  = 3
+HOST_BAR_WIDTH     = 22   # per host panel in left column (~100 cols)
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -618,7 +618,8 @@ def execute_migrations():
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-console = Console(width=TERM_COLS, height=TERM_ROWS, force_terminal=True)
+# Width fixed to 209; height follows terminal (fixed height clips panels)
+console = Console(width=TERM_COLS, force_terminal=True)
 
 
 def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> Text:
@@ -632,7 +633,12 @@ def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> T
     return t
 
 
-def _render_host_panel(hs: HostState) -> Panel:
+def _render_host_panel(
+    hs: HostState,
+    *,
+    bar_width: int = HOST_BAR_WIDTH,
+    vm_max: int = VM_LINES_PER_HOST,
+) -> Panel:
     color = HOST_COLORS.get(hs.name, "white")
 
     alloc_cpu = sum(v.cpu    for v in hs.vms if v.state == "running")
@@ -645,9 +651,9 @@ def _render_host_panel(hs: HostState) -> Panel:
     has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
 
     grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=6)
-    grid.add_column(width=HOST_BAR_WIDTH + 2)
-    grid.add_column(width=16, justify="right")
+    grid.add_column(width=5)
+    grid.add_column(width=bar_width + 1)
+    grid.add_column(width=11, justify="right")
 
     def pct_style(pct: float, base: str) -> str:
         return f"bold {'red' if pct >= 90 else ('yellow' if pct >= 70 else base)}"
@@ -655,34 +661,34 @@ def _render_host_panel(hs: HostState) -> Panel:
     if has_host:
         grid.add_row(
             Text("CPU▲", style="bold white"),
-            _make_bar(cpu_host, HOST_BAR_WIDTH, color),
+            _make_bar(cpu_host, bar_width, color),
             Text(f"{cpu_host:.0f}% host", style=pct_style(cpu_host, color)),
         )
         grid.add_row(
             Text("CPU◇", style="dim"),
-            _make_bar(cpu_alloc_pct, HOST_BAR_WIDTH, "dim"),
+            _make_bar(cpu_alloc_pct, bar_width, "dim"),
             Text(f"{cpu_alloc_pct:.0f}% alloc", style="dim"),
         )
         mem_label = f"{hs.mem_used_mb}/{hs.mem_total_mb}M"
         grid.add_row(
             Text("MEM▲", style="bold white"),
-            _make_bar(mem_host, HOST_BAR_WIDTH, color),
+            _make_bar(mem_host, bar_width, color),
             Text(f"{mem_host:.0f}% {mem_label}", style=pct_style(mem_host, color)),
         )
         grid.add_row(
             Text("MEM◇", style="dim"),
-            _make_bar(mem_alloc_pct, HOST_BAR_WIDTH, "dim"),
+            _make_bar(mem_alloc_pct, bar_width, "dim"),
             Text(f"{mem_alloc_pct:.0f}% alloc", style="dim"),
         )
     else:
         grid.add_row(
             Text("CPU", style="dim"),
-            _make_bar(cpu_alloc_pct, HOST_BAR_WIDTH, color),
+            _make_bar(cpu_alloc_pct, bar_width, color),
             Text(f"{cpu_alloc_pct:.0f}% alloc", style=pct_style(cpu_alloc_pct, color)),
         )
         grid.add_row(
             Text("MEM", style="dim"),
-            _make_bar(mem_alloc_pct, HOST_BAR_WIDTH, color),
+            _make_bar(mem_alloc_pct, bar_width, color),
             Text(f"{mem_alloc_pct:.0f}% alloc", style=pct_style(mem_alloc_pct, color)),
         )
 
@@ -698,7 +704,7 @@ def _render_host_panel(hs: HostState) -> Panel:
             Text("")
         )
     else:
-        shown = hs.vms[:VM_LINES_PER_HOST]
+        shown = hs.vms[:vm_max]
         for vm in shown:
             is_src = mig and mig.vm_name == vm.name and mig.src_host == hs.name
             is_dst = mig and mig.vm_name == vm.name and mig.dst_host == hs.name
@@ -716,13 +722,14 @@ def _render_host_panel(hs: HostState) -> Panel:
                 icon, ic = "○", "dim"
                 label = vm.state[:9]
 
+            vlabel = f"{vm.name[:8]:8} {vm.cpu}c/{vm.mem_mb // 1024}G"
             grid.add_row(
                 Text(icon, style=ic),
-                Text(f"{vm.name} {vm.cpu}c/{vm.mem_mb // 1024}G", style="white"),
+                Text(vlabel, style="white"),
                 Text(label, style=f"dim {ic}"),
             )
-        if len(hs.vms) > VM_LINES_PER_HOST:
-            extra = len(hs.vms) - VM_LINES_PER_HOST
+        if len(hs.vms) > vm_max:
+            extra = len(hs.vms) - vm_max
             grid.add_row(Text(""), Text(f"+{extra} more", style="dim"), Text(""))
 
     border = "red" if not hs.reachable else color
@@ -746,7 +753,7 @@ def _render_status_panel() -> Panel:
         mb_proc  = mig.data_proc_b  / 1024 / 1024
         mb_total = mig.data_total_b / 1024 / 1024
 
-        bar_w = min(120, TERM_COLS - 70)
+        bar_w = min(48, (TERM_COLS // 2) - 28)
         fill  = int(pct / 100 * bar_w)
         bar   = Text()
         bar.append("█" * fill,          style="bold blue")
@@ -803,7 +810,10 @@ def _render_status_panel() -> Panel:
             t.append("✦ Bin Packing complete  ", style="bold yellow")
             t.append(f"{len(moves)} VM(s) to relocate  ", style="white")
             t.append("press [m] to run", style="dim")
-            t.append("\n\n" + "  |  ".join(moves[:4]), style="cyan")
+            line = "  |  ".join(moves[:3])
+            if len(moves) > 3:
+                line += f"  |  +{len(moves) - 3} more"
+            t.append("\n\n" + line[:90], style="cyan")
             return Panel(t, title="PLAN", border_style="yellow", box=box.ROUNDED)
         else:
             return Panel(
@@ -853,36 +863,49 @@ def _render_log_panel() -> Panel:
         "BPK": "bold cyan",
     }
     grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=10, style="dim")
-    grid.add_column(width=6)
-    grid.add_column(width=TERM_COLS - 28)
+    grid.add_column(width=9, style="dim")
+    grid.add_column(width=5)
+    grid.add_column()
 
     with _lock:
         lines = list(log_lines[-LOG_MAX_LINES:])
 
+    msg_w = max(40, (TERM_COLS // 2) - 22)
     for ts, lvl, msg in lines:
+        if len(msg) > msg_w:
+            msg = msg[: msg_w - 1] + "…"
         grid.add_row(
             ts,
             Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
-            Text(msg)
+            Text(msg),
         )
     return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
 
 
 def _build_layout() -> Layout:
-    """Rows sum to 40 (+1 margin) inside TERM_ROWS=41."""
+    """
+    209×41 — 2 columns:
+      left  (~104): Host-A, B, C stacked
+      right (~104): STATUS + LOG
+    """
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="hosts", size=16),
-        Layout(name="status", size=9),
-        Layout(name="log", size=11),
+        Layout(name="main", size=36),
         Layout(name="footer", size=1),
     )
-    layout["hosts"].split_row(
-        Layout(name="host_a"),
-        Layout(name="host_b"),
-        Layout(name="host_c"),
+    layout["main"].split_row(
+        Layout(name="hosts_col", ratio=1),
+        Layout(name="info_col", ratio=1),
+    )
+    layout["hosts_col"].split_column(
+        Layout(name="host_a", size=12),
+        Layout(name="host_b", size=12),
+        Layout(name="host_c", size=12),
+    )
+    layout["info_col"].split_column(
+        Layout(name="status", size=14),
+        Layout(name="log", size=22),
     )
     return layout
 
@@ -900,12 +923,13 @@ def _render(layout: Layout) -> None:
     with _lock:
         host_states = dict(hosts)
 
+    narrow = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
     layout["host_a"].update(_render_host_panel(
-        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False))))
+        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False)), **narrow))
     layout["host_b"].update(_render_host_panel(
-        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False))))
+        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False)), **narrow))
     layout["host_c"].update(_render_host_panel(
-        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False))))
+        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False)), **narrow))
 
     layout["status"].update(_render_status_panel())
     layout["log"].update(_render_log_panel())

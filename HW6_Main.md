@@ -174,7 +174,7 @@ python3 migration_dashboard.py
 
 (`/etc/hw6/cluster.conf` IP 자동 사용)
 
-**SSH 터미널:** UI는 **209×41** 에 맞춤 (PuTTY 등에서 열·행을 209×41로 설정하면 가장 잘 맞음).
+**SSH 터미널:** **209×41** — 2열 UI (왼쪽 Host A/B/C 세로, 오른쪽 STATUS+LOG). PuTTY 열·행 209×41 권장.
 
 | 키 | 동작 | Case |
 |----|------|------|
