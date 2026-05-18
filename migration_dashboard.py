@@ -41,7 +41,6 @@ Platform
   Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
-import shutil
 import subprocess
 import threading
 import time
@@ -69,13 +68,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from rich.live import Live
-from rich.layout import Layout
+from rich.columns import Columns
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.align import Align
-from rich.console import Console
 from rich import box
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -650,7 +648,7 @@ def _render_host_panel(
     mem_host = hs.mem_host_pct if hs.reachable else 0.0
     has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
 
-    grid = Table.grid(padding=(0, 1))
+    grid = Table.grid(padding=(0, 0))
     grid.add_column(width=5)
     grid.add_column(width=bar_width + 1)
     grid.add_column(width=11, justify="right")
@@ -692,17 +690,11 @@ def _render_host_panel(
             Text(f"{mem_alloc_pct:.0f}% alloc", style=pct_style(mem_alloc_pct, color)),
         )
 
-    grid.add_row(Text(""), Text(""), Text(""))
-
     with _lock:
         mig = active_mig
 
     if not hs.vms:
-        grid.add_row(
-            Text(""),
-            Text("[ IDLE ]", style="dim italic"),
-            Text("")
-        )
+        grid.add_row(Text(""), Text("[ IDLE ]", style="dim italic"), Text(""))
     else:
         shown = hs.vms[:vm_max]
         for vm in shown:
@@ -729,8 +721,7 @@ def _render_host_panel(
                 Text(label, style=f"dim {ic}"),
             )
         if len(hs.vms) > vm_max:
-            extra = len(hs.vms) - vm_max
-            grid.add_row(Text(""), Text(f"+{extra} more", style="dim"), Text(""))
+            grid.add_row(Text(""), Text(f"+{len(hs.vms) - vm_max} more", style="dim"), Text(""))
 
     border = "red" if not hs.reachable else color
     return Panel(
@@ -738,6 +729,7 @@ def _render_host_panel(
         title=f"[bold {color}]{hs.name}[/] [dim]{hs.ip}[/dim]",
         border_style=border,
         box=box.ROUNDED,
+        padding=(0, 1),
     )
 
 
@@ -761,7 +753,7 @@ def _render_status_panel() -> Panel:
         bar.append(f"  {pct:.0f}%",     style="bold cyan")
 
         arrow = "─" * 16
-        t = Table.grid(padding=(0, 1))
+        t = Table.grid(padding=(0, 0))
         t.add_column(width=12)
         t.add_column()
         t.add_row(
@@ -770,14 +762,11 @@ def _render_status_panel() -> Panel:
                  f"{mig.src_host} {arrow}► {mig.dst_host}",
                  style="bold white")
         )
-        t.add_row(Text(""), Text(""))
         t.add_row(Text("Progress", style="dim"), bar)
         t.add_row(
             Text(""),
-            Text(f"{mb_proc:.1f} MB / {mb_total:.1f} MB transferred",
-                 style="dim")
+            Text(f"{mb_proc:.1f} / {mb_total:.1f} MB", style="dim"),
         )
-        t.add_row(Text(""), Text(""))
 
         dirty_c = ("red" if mig.dirty_rate > 2000
                    else "yellow" if mig.dirty_rate > 500 else "green")
@@ -794,8 +783,8 @@ def _render_status_panel() -> Panel:
                 Text(f"{mig.downtime_ms} ms (live)", style="bold green"),
             )
 
-        return Panel(t, title="🚀 LIVE MIGRATION",
-                     border_style="blue", box=box.ROUNDED)
+        return Panel(t, title="LIVE MIGRATION", border_style="blue",
+                     box=box.ROUNDED, padding=(0, 1))
 
     # ── Bin Packing plan ready ─────────────────────────────────────────────────
     if plan:
@@ -814,11 +803,12 @@ def _render_status_panel() -> Panel:
             if len(moves) > 3:
                 line += f"  |  +{len(moves) - 3} more"
             t.append("\n\n" + line[:90], style="cyan")
-            return Panel(t, title="PLAN", border_style="yellow", box=box.ROUNDED)
+            return Panel(t, title="PLAN", border_style="yellow",
+                         box=box.ROUNDED, padding=(0, 1))
         else:
             return Panel(
-                Text("✓ Current placement is already optimal.", style="green"),
-                title="PLAN", border_style="dim", box=box.ROUNDED
+                Text("Current placement is already optimal.", style="green"),
+                title="PLAN", border_style="dim", box=box.ROUNDED, padding=(0, 1),
             )
 
     # ── Recent migration metrics ─────────────────────────────────────────────
@@ -826,7 +816,7 @@ def _render_status_panel() -> Panel:
         recent = list(mig_history[-3:])
 
     if recent and not mig:
-        hist = Table.grid(padding=(0, 1))
+        hist = Table.grid(padding=(0, 0))
         hist.add_column(width=10)
         hist.add_column()
         for j in reversed(recent):
@@ -840,17 +830,16 @@ def _render_status_panel() -> Panel:
             elif j.failed:
                 line.append("  FAILED", style="bold red")
             hist.add_row(Text("Last mig", style="dim"), line)
-        return Panel(hist, title="MIGRATION STATS",
-                     border_style="dim green", box=box.ROUNDED)
+        return Panel(hist, title="MIGRATION STATS", border_style="dim green",
+                     box=box.ROUNDED, padding=(0, 1))
 
-    # ── Idle ─────────────────────────────────────────────────────────────────
     t = Text()
     t.append("Idle — ", style="dim")
-    t.append("[r]", style="bold yellow"); t.append(" spread/defrag  ", style="dim")
-    t.append("[c]", style="bold yellow"); t.append(" Host-C Idle  ", style="dim")
-    t.append("[l]", style="bold yellow"); t.append(" load balance  ", style="dim")
-    t.append("[m]", style="bold yellow"); t.append(" run migration", style="dim")
-    return Panel(t, title="STATUS", border_style="dim", box=box.ROUNDED)
+    t.append("[r] spread  ", style="dim")
+    t.append("[c] C-idle  ", style="dim")
+    t.append("[l] balance  ", style="dim")
+    t.append("[m] migrate", style="dim")
+    return Panel(t, title="STATUS", border_style="dim", box=box.ROUNDED, padding=(0, 1))
 
 
 def _render_log_panel() -> Panel:
@@ -862,9 +851,9 @@ def _render_log_panel() -> Panel:
         "MIG": "bold magenta",
         "BPK": "bold cyan",
     }
-    grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=9, style="dim")
-    grid.add_column(width=5)
+    grid = Table.grid(padding=(0, 0))
+    grid.add_column(width=8, style="dim")
+    grid.add_column(width=4)
     grid.add_column()
 
     with _lock:
@@ -879,73 +868,51 @@ def _render_log_panel() -> Panel:
             Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
             Text(msg),
         )
-    return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
+    return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED, padding=(0, 1))
 
 
-def _build_layout() -> Layout:
-    """
-    209×41 — 2 columns:
-      left  (~104): Host-A, B, C stacked
-      right (~104): STATUS + LOG
-    """
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main", size=36),
-        Layout(name="footer", size=1),
-    )
-    layout["main"].split_row(
-        Layout(name="hosts_col", ratio=1),
-        Layout(name="info_col", ratio=1),
-    )
-    layout["hosts_col"].split_column(
-        Layout(name="host_a", size=12),
-        Layout(name="host_b", size=12),
-        Layout(name="host_c", size=12),
-    )
-    layout["info_col"].split_column(
-        Layout(name="status", size=14),
-        Layout(name="log", size=22),
-    )
-    return layout
+def _footer_text() -> Text:
+    footer = Text(justify="center")
+    for key, desc in (
+        ("[r]", "BinPack"),
+        ("[c]", "C-idle"),
+        ("[l]", "LoadBal"),
+        ("[m]", "Migrate"),
+        ("[q]", "Quit"),
+    ):
+        footer.append(key, style="bold yellow")
+        footer.append(f" {desc}  ", style="dim")
+    footer.append(time.strftime("%H:%M:%S"), style="dim")
+    return footer
 
 
-def _render(layout: Layout) -> None:
-    layout["header"].update(Panel(
-        Align.center(Text(
-            "HW6 Live Migration Dashboard  ·  2D Bin Packing",
-            style="bold cyan",
-        )),
+def _draw_dashboard() -> None:
+    """209×41 — 2 columns via Columns+Group (no Layout slots = no floating gaps)."""
+    console.clear(home=True)
+
+    console.print(Panel(
+        Align.center(Text("HW6 Live Migration Dashboard", style="bold cyan")),
+        box=box.HEAVY,
         border_style="blue",
-        box=box.HEAVY_HEAD,
+        padding=(0, 1),
     ))
 
     with _lock:
         host_states = dict(hosts)
 
-    narrow = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
-    layout["host_a"].update(_render_host_panel(
-        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False)), **narrow))
-    layout["host_b"].update(_render_host_panel(
-        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False)), **narrow))
-    layout["host_c"].update(_render_host_panel(
-        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False)), **narrow))
+    kw = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
+    left = Group(
+        _render_host_panel(host_states.get(
+            "Host-A", HostState("Host-A", "", 8, 16384, reachable=False)), **kw),
+        _render_host_panel(host_states.get(
+            "Host-B", HostState("Host-B", "", 8, 16384, reachable=False)), **kw),
+        _render_host_panel(host_states.get(
+            "Host-C", HostState("Host-C", "", 8, 16384, reachable=False)), **kw),
+    )
+    right = Group(_render_status_panel(), _render_log_panel())
 
-    layout["status"].update(_render_status_panel())
-    layout["log"].update(_render_log_panel())
-
-    footer = Text(justify="center")
-    for key, desc in (
-        ("[r]", "Spread BinPack"),
-        ("[c]", "Consolidate (C idle)"),
-        ("[l]", "Load balance"),
-        ("[m]", "Run migration"),
-        ("[q]", "Quit"),
-    ):
-        footer.append(key, style="bold yellow")
-        footer.append(f" {desc}   ", style="dim")
-    footer.append(time.strftime("%H:%M:%S"), style="dim")
-    layout["footer"].update(Align.center(footer))
+    console.print(Columns([left, right], equal=True, expand=True))
+    console.print(Align.center(_footer_text()))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Key handling
@@ -1049,13 +1016,6 @@ def main():
 
     _init_hosts()
 
-    tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
-    if tw != TERM_COLS or th != TERM_ROWS:
-        console.print(
-            f"[dim]Layout {TERM_COLS}x{TERM_ROWS} — your terminal is {tw}x{th} "
-            f"(resize SSH window to match for best fit)[/dim]"
-        )
-
     log("OK",  "Dashboard started")
     log("INF", f"libvirt — A:{HOSTS_CONFIG['Host-A']['ip']} "
               f"B:{HOSTS_CONFIG['Host-B']['ip']} "
@@ -1065,30 +1025,21 @@ def main():
     upd = threading.Thread(target=_update_loop, daemon=True)
     upd.start()
 
-    layout = _build_layout()
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        with Live(
-            layout,
-            console=console,
-            screen=True,
-            transient=True,
-            auto_refresh=False,
-            refresh_per_second=1,
-        ) as live:
-            while running:
-                _render(layout)
-                live.refresh()
-                if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
-                    key = sys.stdin.read(1)
-                    if key in ("q", "\x03"):
-                        running = False
-                        break
-                    _handle_key(key)
+        while running:
+            _draw_dashboard()
+            if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
+                key = sys.stdin.read(1)
+                if key in ("q", "\x03"):
+                    running = False
+                    break
+                _handle_key(key)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        console.print("\n[dim]Dashboard exited.[/dim]")
+        console.clear(home=True)
+        console.print("[dim]Dashboard exited.[/dim]")
 
 
 if __name__ == "__main__":
