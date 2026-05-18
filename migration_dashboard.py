@@ -27,7 +27,7 @@ Features
   - Migration downtime from virsh domjobinfo
   - 2D Bin Packing (FFD algorithm) placement planning
   - virsh live migration orchestration
-  - Fixed-grid ASCII TUI (236x48 SSH terminal)
+  - rich-based TUI (terminal UI)
 
 Usage
 -----
@@ -69,7 +69,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from rich.live import Live
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.align import Align
 from rich.console import Console
+from rich import box
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Configuration — loaded from /etc/hw6/cluster.conf (written by setup_*.sh)
@@ -84,20 +91,12 @@ HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 UI_REFRESH_SEC   = 1.0   # keyboard poll interval
-# SSH terminal 236×48 (2-col margin avoids right-edge wrap on last column)
-TERM_COLS = 236
-TERM_ROWS = 48
-TERM_MARGIN = 2
-LOG_MAX_LINES = 20
-VM_LINES_PER_HOST = 4
-
-# Geometry (recomputed each frame) — fixed char grid, no Rich Layout
-_ui_safe_cols = TERM_COLS - TERM_MARGIN
-_ui_safe_rows = TERM_ROWS - 1
-_ui_hw = 56          # Host-A|B|C column width
-_ui_sw = 61          # STATUS+LOG column width
-_ui_data_rows = 36   # main body height
-_ui_status_rows = 10
+# SSH terminal 209×41 — 2-column UI: hosts (left) | status+log (right)
+TERM_COLS = 209
+TERM_ROWS = 41
+LOG_MAX_LINES      = 12
+VM_LINES_PER_HOST  = 3
+HOST_BAR_WIDTH     = 22   # per host panel in left column (~100 cols)
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -616,246 +615,337 @@ def execute_migrations():
     threading.Thread(target=_run_all, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TUI rendering — fixed-width ASCII grid (SSH / MobaXterm safe)
+#  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-console = Console()
+# Width fixed to 209; height follows terminal (fixed height clips panels)
+console = Console(width=TERM_COLS, force_terminal=True)
 
 
-def _refresh_geometry() -> None:
-    """236x48 target; scale columns if terminal is smaller."""
-    global _ui_safe_cols, _ui_safe_rows, _ui_hw, _ui_sw, _ui_data_rows
-    tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
-    _ui_safe_cols = min(tw, TERM_COLS) - TERM_MARGIN
-    _ui_safe_rows = min(th, TERM_ROWS) - 1
-    inner = _ui_safe_cols - 5
-    _ui_hw = max(40, (inner * 56) // 229)
-    _ui_sw = max(44, inner - 3 * _ui_hw)
-    _ui_data_rows = max(20, _ui_safe_rows - 11)
+def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> Text:
+    """Build a text progress bar."""
+    pct   = max(0.0, min(100.0, pct))
+    fill  = int(pct / 100 * width)
+    c     = "red" if pct >= 90 else ("yellow" if pct >= 70 else color)
+    t = Text()
+    t.append("█" * fill,           style=f"bold {c}")
+    t.append("░" * (width - fill), style="dim")
+    return t
 
 
-def _fit(s: str, width: int) -> str:
-    if width <= 0:
-        return ""
-    if len(s) <= width:
-        return s.ljust(width)
-    if width <= 3:
-        return s[:width]
-    return s[: width - 3] + "..."
+def _render_host_panel(
+    hs: HostState,
+    *,
+    bar_width: int = HOST_BAR_WIDTH,
+    vm_max: int = VM_LINES_PER_HOST,
+) -> Panel:
+    color = HOST_COLORS.get(hs.name, "white")
 
-
-def _center(s: str, width: int) -> str:
-    s = s[:width]
-    if len(s) >= width:
-        return s
-    pad = width - len(s)
-    left = pad // 2
-    return " " * left + s + " " * (pad - left)
-
-
-def _hline(width: int, char: str = "-") -> str:
-    return "+" + char * max(0, width - 2) + "+"
-
-
-def _midline(width: int, col_widths: Tuple[int, ...]) -> str:
-    parts = ["+"]
-    for cw in col_widths:
-        parts.append("-" * cw)
-        parts.append("+")
-    return _fit("".join(parts), width)
-
-
-def _vrow(cells: Tuple[str, ...], col_widths: Tuple[int, ...]) -> str:
-    parts = ["|"]
-    for text, cw in zip(cells, col_widths):
-        parts.append(_fit(text, cw))
-        parts.append("|")
-    return "".join(parts)
-
-
-def _ascii_bar(pct: float, width: int) -> str:
-    pct = max(0.0, min(100.0, pct))
-    fill = int(pct / 100.0 * width)
-    return "#" * fill + "." * (width - fill)
-
-
-def _metric_line(label: str, pct: float, col_w: int, suffix: str = "") -> str:
-    bw = max(6, col_w - len(label) - len(suffix) - 6)
-    bar = _ascii_bar(pct, bw)
-    return _fit(f"{label}{bar} {pct:3.0f}%{suffix}", col_w)
-
-
-def _host_column_lines(hs: HostState, col_w: int, mig: Optional[MigrationJob]) -> List[str]:
-    lines: List[str] = []
-    tag = "!" if not hs.reachable else " "
-    lines.append(_fit(f"{tag}{hs.name} {hs.ip}", col_w))
-
-    alloc_cpu = sum(v.cpu for v in hs.vms if v.state == "running")
+    alloc_cpu = sum(v.cpu    for v in hs.vms if v.state == "running")
     alloc_mem = sum(v.mem_mb for v in hs.vms if v.state == "running")
-    cpu_a = alloc_cpu / hs.cpu_cap * 100 if hs.cpu_cap else 0
-    mem_a = alloc_mem / hs.mem_cap_mb * 100 if hs.mem_cap_mb else 0
-    cpu_h = hs.cpu_host_pct if hs.reachable else 0.0
-    mem_h = hs.mem_host_pct if hs.reachable else 0.0
-    has_host = hs.reachable and (cpu_h > 0 or mem_h > 0 or hs.mem_total_mb > 0)
+    cpu_alloc_pct = alloc_cpu / hs.cpu_cap * 100 if hs.cpu_cap else 0
+    mem_alloc_pct = alloc_mem / hs.mem_cap_mb * 100 if hs.mem_cap_mb else 0
+
+    cpu_host = hs.cpu_host_pct if hs.reachable else 0.0
+    mem_host = hs.mem_host_pct if hs.reachable else 0.0
+    has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
+
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(width=5)
+    grid.add_column(width=bar_width + 1)
+    grid.add_column(width=11, justify="right")
+
+    def pct_style(pct: float, base: str) -> str:
+        return f"bold {'red' if pct >= 90 else ('yellow' if pct >= 70 else base)}"
 
     if has_host:
-        lines.append(_metric_line("Ch", cpu_h, col_w, " host"))
-        lines.append(_metric_line("Ca", cpu_a, col_w, " alloc"))
-        mem_sfx = f" {hs.mem_used_mb}/{hs.mem_total_mb}M"
-        lines.append(_metric_line("Mh", mem_h, col_w, mem_sfx[: max(0, col_w - 12)]))
-        lines.append(_metric_line("Ma", mem_a, col_w, " alloc"))
+        grid.add_row(
+            Text("CPU▲", style="bold white"),
+            _make_bar(cpu_host, bar_width, color),
+            Text(f"{cpu_host:.0f}% host", style=pct_style(cpu_host, color)),
+        )
+        grid.add_row(
+            Text("CPU◇", style="dim"),
+            _make_bar(cpu_alloc_pct, bar_width, "dim"),
+            Text(f"{cpu_alloc_pct:.0f}% alloc", style="dim"),
+        )
+        mem_label = f"{hs.mem_used_mb}/{hs.mem_total_mb}M"
+        grid.add_row(
+            Text("MEM▲", style="bold white"),
+            _make_bar(mem_host, bar_width, color),
+            Text(f"{mem_host:.0f}% {mem_label}", style=pct_style(mem_host, color)),
+        )
+        grid.add_row(
+            Text("MEM◇", style="dim"),
+            _make_bar(mem_alloc_pct, bar_width, "dim"),
+            Text(f"{mem_alloc_pct:.0f}% alloc", style="dim"),
+        )
     else:
-        lines.append(_metric_line("Ca", cpu_a, col_w, " alloc"))
-        lines.append(_metric_line("Ma", mem_a, col_w, " alloc"))
+        grid.add_row(
+            Text("CPU", style="dim"),
+            _make_bar(cpu_alloc_pct, bar_width, color),
+            Text(f"{cpu_alloc_pct:.0f}% alloc", style=pct_style(cpu_alloc_pct, color)),
+        )
+        grid.add_row(
+            Text("MEM", style="dim"),
+            _make_bar(mem_alloc_pct, bar_width, color),
+            Text(f"{mem_alloc_pct:.0f}% alloc", style=pct_style(mem_alloc_pct, color)),
+        )
 
-    lines.append(_fit("-" * min(col_w, 40), col_w))
+    grid.add_row(Text(""), Text(""), Text(""))
+
+    with _lock:
+        mig = active_mig
 
     if not hs.vms:
-        lines.append(_fit("[ IDLE ]", col_w))
+        grid.add_row(
+            Text(""),
+            Text("[ IDLE ]", style="dim italic"),
+            Text("")
+        )
     else:
-        for vm in hs.vms[:VM_LINES_PER_HOST]:
-            if mig and mig.vm_name == vm.name and mig.src_host == hs.name:
-                icon, label = ">", "migrating"
-            elif mig and mig.vm_name == vm.name and mig.dst_host == hs.name:
-                icon, label = "<", "arriving"
+        shown = hs.vms[:vm_max]
+        for vm in shown:
+            is_src = mig and mig.vm_name == vm.name and mig.src_host == hs.name
+            is_dst = mig and mig.vm_name == vm.name and mig.dst_host == hs.name
+
+            if is_src:
+                icon, ic = "⇢", "cyan"
+                label = "migrating"
+            elif is_dst:
+                icon, ic = "⇣", "bright_green"
+                label = "arriving "
             elif vm.state == "running":
-                icon, label = "*", "running"
+                icon, ic = "●", "green"
+                label = "running  "
             else:
-                icon, label = "-", vm.state[:8]
-            lines.append(_fit(
-                f"{icon}{vm.name:<8}{vm.cpu}c{vm.mem_mb // 1024:>2}G {label}", col_w
-            ))
-        extra = len(hs.vms) - VM_LINES_PER_HOST
-        if extra > 0:
-            lines.append(_fit(f"+{extra} more VM(s)", col_w))
+                icon, ic = "○", "dim"
+                label = vm.state[:9]
 
-    while len(lines) < _ui_data_rows:
-        lines.append(" " * col_w)
-    return lines[:_ui_data_rows]
+            vlabel = f"{vm.name[:8]:8} {vm.cpu}c/{vm.mem_mb // 1024}G"
+            grid.add_row(
+                Text(icon, style=ic),
+                Text(vlabel, style="white"),
+                Text(label, style=f"dim {ic}"),
+            )
+        if len(hs.vms) > vm_max:
+            extra = len(hs.vms) - vm_max
+            grid.add_row(Text(""), Text(f"+{extra} more", style="dim"), Text(""))
+
+    border = "red" if not hs.reachable else color
+    return Panel(
+        grid,
+        title=f"[bold {color}]{hs.name}[/] [dim]{hs.ip}[/dim]",
+        border_style=border,
+        box=box.ROUNDED,
+    )
 
 
-def _status_column_lines(col_w: int) -> List[str]:
-    out: List[str] = []
+def _render_status_panel() -> Panel:
     with _lock:
-        mig = active_mig
+        mig  = active_mig
         plan = dict(bin_pack_plan)
+
+    # ── Migration in progress ────────────────────────────────────────────────
+    if mig:
+        pct = (mig.data_proc_b / mig.data_total_b * 100
+               if mig.data_total_b > 0 else 0)
+        mb_proc  = mig.data_proc_b  / 1024 / 1024
+        mb_total = mig.data_total_b / 1024 / 1024
+
+        bar_w = min(48, (TERM_COLS // 2) - 28)
+        fill  = int(pct / 100 * bar_w)
+        bar   = Text()
+        bar.append("█" * fill,          style="bold blue")
+        bar.append("░" * (bar_w - fill), style="dim")
+        bar.append(f"  {pct:.0f}%",     style="bold cyan")
+
+        arrow = "─" * 16
+        t = Table.grid(padding=(0, 1))
+        t.add_column(width=12)
+        t.add_column()
+        t.add_row(
+            Text("MIGRATING", style="bold cyan"),
+            Text(f"{mig.vm_name}  "
+                 f"{mig.src_host} {arrow}► {mig.dst_host}",
+                 style="bold white")
+        )
+        t.add_row(Text(""), Text(""))
+        t.add_row(Text("Progress", style="dim"), bar)
+        t.add_row(
+            Text(""),
+            Text(f"{mb_proc:.1f} MB / {mb_total:.1f} MB transferred",
+                 style="dim")
+        )
+        t.add_row(Text(""), Text(""))
+
+        dirty_c = ("red" if mig.dirty_rate > 2000
+                   else "yellow" if mig.dirty_rate > 500 else "green")
+        stats = Text()
+        stats.append("Dirty rate  ", style="dim")
+        stats.append(f"{mig.dirty_rate:,} pages/s", style=f"bold {dirty_c}")
+        stats.append("    Method  ", style="dim")
+        stats.append("Precopy",     style="white")
+        t.add_row(Text(""), stats)
+
+        if mig.downtime_ms is not None:
+            t.add_row(
+                Text("Downtime", style="dim"),
+                Text(f"{mig.downtime_ms} ms (live)", style="bold green"),
+            )
+
+        return Panel(t, title="🚀 LIVE MIGRATION",
+                     border_style="blue", box=box.ROUNDED)
+
+    # ── Bin Packing plan ready ─────────────────────────────────────────────────
+    if plan:
+        with _lock:
+            current = {v.name: v.host
+                       for hs in hosts.values() for v in hs.vms}
+        moves = [f"{vm} {current.get(vm,'?')} → {tgt}"
+                 for vm, tgt in plan.items()
+                 if current.get(vm) != tgt]
+        if moves:
+            t = Text()
+            t.append("✦ Bin Packing complete  ", style="bold yellow")
+            t.append(f"{len(moves)} VM(s) to relocate  ", style="white")
+            t.append("press [m] to run", style="dim")
+            line = "  |  ".join(moves[:3])
+            if len(moves) > 3:
+                line += f"  |  +{len(moves) - 3} more"
+            t.append("\n\n" + line[:90], style="cyan")
+            return Panel(t, title="PLAN", border_style="yellow", box=box.ROUNDED)
+        else:
+            return Panel(
+                Text("✓ Current placement is already optimal.", style="green"),
+                title="PLAN", border_style="dim", box=box.ROUNDED
+            )
+
+    # ── Recent migration metrics ─────────────────────────────────────────────
+    with _lock:
         recent = list(mig_history[-3:])
 
-    if mig:
-        pct = mig.data_proc_b / mig.data_total_b * 100 if mig.data_total_b else 0
-        mb_p = mig.data_proc_b / 1024 / 1024
-        mb_t = mig.data_total_b / 1024 / 1024
-        bw = max(6, col_w - 14)
-        out.append(_fit("== LIVE MIGRATION ==", col_w))
-        out.append(_fit(f"{mig.vm_name}", col_w))
-        out.append(_fit(f"{mig.src_host}->{mig.dst_host}", col_w))
-        out.append(_fit(f"{_ascii_bar(pct, bw)} {pct:.0f}%", col_w))
-        out.append(_fit(f"{mb_p:.1f}/{mb_t:.1f} MB", col_w))
-        out.append(_fit(f"dirty {mig.dirty_rate}/s", col_w))
-        if mig.downtime_ms is not None:
-            out.append(_fit(f"down {mig.downtime_ms}ms", col_w))
-    elif plan:
-        with _lock:
-            current = {v.name: v.host for h in hosts.values() for v in h.vms}
-        moves = [f"{vm}:{current.get(vm,'?')}->{tgt}"
-                 for vm, tgt in plan.items() if current.get(vm) != tgt]
-        out.append(_fit("== BIN PACK PLAN ==", col_w))
-        if moves:
-            out.append(_fit(f"{len(moves)} VM(s) [m] run", col_w))
-            for m in moves[:6]:
-                out.append(_fit(m, col_w))
-        else:
-            out.append(_fit("already optimal", col_w))
-    elif recent:
-        out.append(_fit("== LAST MIGRATIONS ==", col_w))
+    if recent and not mig:
+        hist = Table.grid(padding=(0, 1))
+        hist.add_column(width=10)
+        hist.add_column()
         for j in reversed(recent):
-            s = f"{j.vm_name} {j.elapsed:.1f}s"
+            line = Text()
+            line.append(f"{j.vm_name} ", style="bold")
+            line.append(f"{j.src_host}→{j.dst_host}  ", style="dim")
+            line.append(f"{j.elapsed:.1f}s", style="cyan")
             if j.downtime_ms is not None:
-                s += f" dt{j.downtime_ms}ms"
+                line.append(f"  downtime ", style="dim")
+                line.append(f"{j.downtime_ms} ms", style="bold green")
             elif j.failed:
-                s += " FAIL"
-            out.append(_fit(s, col_w))
-    else:
-        out.append(_fit("== STATUS ==", col_w))
-        out.append(_fit("Idle", col_w))
-        out.append(_fit("[r]pack [c]C-idle", col_w))
-        out.append(_fit("[l]balance [m]go", col_w))
+                line.append("  FAILED", style="bold red")
+            hist.add_row(Text("Last mig", style="dim"), line)
+        return Panel(hist, title="MIGRATION STATS",
+                     border_style="dim green", box=box.ROUNDED)
 
-    while len(out) < _ui_status_rows:
-        out.append("")
-    return out[:_ui_status_rows]
-
-
-def _log_column_lines(col_w: int) -> List[str]:
-    rows = _ui_data_rows - _ui_status_rows
-    out: List[str] = []
-    out.append(_fit("== LOG ==", col_w))
-    with _lock:
-        entries = list(log_lines[-rows:])
-    for ts, lvl, msg in entries:
-        out.append(_fit(f"{ts}[{lvl}]{msg}", col_w))
-    if not entries:
-        out.append(_fit("(no messages)", col_w))
-    while len(out) < rows:
-        out.append("")
-    return out[:rows]
+    # ── Idle ─────────────────────────────────────────────────────────────────
+    t = Text()
+    t.append("Idle — ", style="dim")
+    t.append("[r]", style="bold yellow"); t.append(" spread/defrag  ", style="dim")
+    t.append("[c]", style="bold yellow"); t.append(" Host-C Idle  ", style="dim")
+    t.append("[l]", style="bold yellow"); t.append(" load balance  ", style="dim")
+    t.append("[m]", style="bold yellow"); t.append(" run migration", style="dim")
+    return Panel(t, title="STATUS", border_style="dim", box=box.ROUNDED)
 
 
-def _footer_text() -> str:
-    return ("[r]BinPack  [c]C-idle  [l]LoadBal  [m]Migrate  [q]Quit  "
-            + time.strftime("%H:%M:%S"))
-
-
-def _build_frame() -> List[str]:
-    """Every line is exactly _ui_safe_cols characters."""
-    w = _ui_safe_cols
-    cols = (_ui_hw, _ui_hw, _ui_hw, _ui_sw)
+def _render_log_panel() -> Panel:
+    LEVEL_STYLE = {
+        "OK":  "bold green",
+        "INF": "bold blue",
+        "WRN": "bold yellow",
+        "ERR": "bold red",
+        "MIG": "bold magenta",
+        "BPK": "bold cyan",
+    }
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(width=9, style="dim")
+    grid.add_column(width=5)
+    grid.add_column()
 
     with _lock:
-        host_states = {n: hosts.get(n) for n in ("Host-A", "Host-B", "Host-C")}
-        mig = active_mig
+        lines = list(log_lines[-LOG_MAX_LINES:])
 
-    ha = _host_column_lines(
-        host_states["Host-A"] or HostState("Host-A", "", 8, 16384, reachable=False),
-        _ui_hw, mig)
-    hb = _host_column_lines(
-        host_states["Host-B"] or HostState("Host-B", "", 8, 16384, reachable=False),
-        _ui_hw, mig)
-    hc = _host_column_lines(
-        host_states["Host-C"] or HostState("Host-C", "", 8, 16384, reachable=False),
-        _ui_hw, mig)
-    status = _status_column_lines(_ui_sw)
-    logcol = _log_column_lines(_ui_sw)
-
-    frame: List[str] = []
-    frame.append(_hline(w))
-    frame.append("|" + _center("HW6 Live Migration Dashboard", w - 2) + "|")
-    frame.append(_midline(w, cols))
-    frame.append(_vrow(("Host-A", "Host-B", "Host-C", "STATUS / LOG"), cols))
-
-    for i in range(_ui_data_rows):
-        side = status[i] if i < _ui_status_rows else logcol[i - _ui_status_rows]
-        frame.append(_vrow((ha[i], hb[i], hc[i], side), cols))
-
-    frame.append(_hline(w))
-    frame.append("|" + _center(_fit(_footer_text(), w - 2), w - 2) + "|")
-    frame.append(_hline(w))
-
-    fixed: List[str] = []
-    for line in frame:
-        fixed.append(_fit(line, w))
-    while len(fixed) < _ui_safe_rows:
-        fixed.append(_fit("", w))
-    return fixed[:_ui_safe_rows]
+    msg_w = max(40, (TERM_COLS // 2) - 22)
+    for ts, lvl, msg in lines:
+        if len(msg) > msg_w:
+            msg = msg[: msg_w - 1] + "…"
+        grid.add_row(
+            ts,
+            Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
+            Text(msg),
+        )
+    return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
 
 
-def _draw_dashboard() -> None:
-    """Redraw full frame with ANSI (no Rich Layout/Panel)."""
-    _refresh_geometry()
-    sys.stdout.write("\033[H\033[J")
-    for line in _build_frame():
-        sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+def _build_layout() -> Layout:
+    """
+    209×41 — 2 columns:
+      left  (~104): Host-A, B, C stacked
+      right (~104): STATUS + LOG
+    """
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main", size=36),
+        Layout(name="footer", size=1),
+    )
+    layout["main"].split_row(
+        Layout(name="hosts_col", ratio=1),
+        Layout(name="info_col", ratio=1),
+    )
+    layout["hosts_col"].split_column(
+        Layout(name="host_a", size=12),
+        Layout(name="host_b", size=12),
+        Layout(name="host_c", size=12),
+    )
+    layout["info_col"].split_column(
+        Layout(name="status", size=14),
+        Layout(name="log", size=22),
+    )
+    return layout
+
+
+def _render(layout: Layout) -> None:
+    layout["header"].update(Panel(
+        Align.center(Text(
+            "HW6 Live Migration Dashboard  ·  2D Bin Packing",
+            style="bold cyan",
+        )),
+        border_style="blue",
+        box=box.HEAVY_HEAD,
+    ))
+
+    with _lock:
+        host_states = dict(hosts)
+
+    narrow = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
+    layout["host_a"].update(_render_host_panel(
+        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False)), **narrow))
+    layout["host_b"].update(_render_host_panel(
+        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False)), **narrow))
+    layout["host_c"].update(_render_host_panel(
+        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False)), **narrow))
+
+    layout["status"].update(_render_status_panel())
+    layout["log"].update(_render_log_panel())
+
+    footer = Text(justify="center")
+    for key, desc in (
+        ("[r]", "Spread BinPack"),
+        ("[c]", "Consolidate (C idle)"),
+        ("[l]", "Load balance"),
+        ("[m]", "Run migration"),
+        ("[q]", "Quit"),
+    ):
+        footer.append(key, style="bold yellow")
+        footer.append(f" {desc}   ", style="dim")
+    footer.append(time.strftime("%H:%M:%S"), style="dim")
+    layout["footer"].update(Align.center(footer))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Key handling
@@ -959,6 +1049,13 @@ def main():
 
     _init_hosts()
 
+    tw, th = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
+    if tw != TERM_COLS or th != TERM_ROWS:
+        console.print(
+            f"[dim]Layout {TERM_COLS}x{TERM_ROWS} — your terminal is {tw}x{th} "
+            f"(resize SSH window to match for best fit)[/dim]"
+        )
+
     log("OK",  "Dashboard started")
     log("INF", f"libvirt — A:{HOSTS_CONFIG['Host-A']['ip']} "
               f"B:{HOSTS_CONFIG['Host-B']['ip']} "
@@ -968,24 +1065,30 @@ def main():
     upd = threading.Thread(target=_update_loop, daemon=True)
     upd.start()
 
+    layout = _build_layout()
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        sys.stdout.write("\033[?25l")
-        sys.stdout.flush()
-        while running:
-            _draw_dashboard()
-            if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
-                key = sys.stdin.read(1)
-                if key in ("q", "\x03"):
-                    running = False
-                    break
-                _handle_key(key)
+        with Live(
+            layout,
+            console=console,
+            screen=True,
+            transient=True,
+            auto_refresh=False,
+            refresh_per_second=1,
+        ) as live:
+            while running:
+                _render(layout)
+                live.refresh()
+                if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
+                    key = sys.stdin.read(1)
+                    if key in ("q", "\x03"):
+                        running = False
+                        break
+                    _handle_key(key)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\033[?25h\033[H\033[J")
-        sys.stdout.flush()
-        console.print("[dim]Dashboard exited.[/dim]")
+        console.print("\n[dim]Dashboard exited.[/dim]")
 
 
 if __name__ == "__main__":

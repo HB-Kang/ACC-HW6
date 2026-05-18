@@ -174,7 +174,7 @@ python3 migration_dashboard.py
 
 (`/etc/hw6/cluster.conf` IP 자동 사용)
 
-**SSH 터미널:** **236×48** 고정 (MobaXterm/PuTTY). 대시보드는 Rich Layout 없이 ASCII 격자로 그림.
+**SSH 터미널:** **209×41** 권장 (MobaXterm/PuTTY). 2열: 왼쪽 Host A/B/C, 오른쪽 STATUS+LOG (`rich` Layout).
 
 | 키 | 동작 | Case |
 |----|------|------|
