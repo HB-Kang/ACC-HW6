@@ -3,14 +3,42 @@
 HW6 - Live Migration Dashboard
 Advanced Cloud Computing 2026
 
-Features:
-  - Real-time KVM host monitoring (CPU/MEM/VM list)
+Dependencies (pip)
+------------------
+  Python 3.9+ (stdlib only besides rich)
+
+  pip3 install rich
+
+  Rocky Linux 10 (PEP 668 / system Python):
+
+    pip3 install rich --break-system-packages
+
+  setup_main.sh installs this automatically on Host-A.
+
+Prerequisites
+-------------
+  - Run on Host-A (servera) as root or a user that can virsh + ssh to B/C
+  - /etc/hw6/cluster.conf exists (from setup_main.sh)
+  - Passwordless SSH: root@servera / serverb / serverc
+
+Features
+--------
+  - Real-time KVM host monitoring (allocated vs actual host CPU/MEM)
+  - Migration downtime from virsh domjobinfo
   - 2D Bin Packing (FFD algorithm) placement planning
   - virsh live migration orchestration
   - rich-based TUI (terminal UI)
 
-Usage: python3 migration_dashboard.py
-Keys: [r] Bin Packing  [c] Consolidate (C Idle)  [m] Migrate  [q] Quit
+Usage
+-----
+  python3 migration_dashboard.py   (Linux only — Host-A Rocky)
+
+Keys: [r] Bin Packing  [c] Consolidate (C Idle)  [l] Load balance  [m] Migrate  [q] Quit
+
+Platform
+--------
+  Not supported on native Windows (needs termios/tty + virsh over SSH).
+  Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
 import subprocess
@@ -19,6 +47,21 @@ import time
 import re
 import sys
 import select
+
+if sys.platform == "win32":
+    print(
+        "migration_dashboard.py must run on Linux (Host-A Rocky).\n"
+        "  Windows Python lacks the 'termios' module (Unix TUI keyboard input).\n"
+        "\n"
+        "  Run on servera after setup_main.sh:\n"
+        "    python3 migration_dashboard.py\n"
+        "\n"
+        "  From this PC, use SSH instead:\n"
+        "    ssh root@<Host-A-IP>\n"
+        "    cd /path/to/ACC && python3 migration_dashboard.py\n"
+    )
+    sys.exit(1)
+
 import tty
 import termios
 from dataclasses import dataclass, field
@@ -85,6 +128,11 @@ class HostState:
     mem_cap_mb: int
     vms:        List[VMInfo] = field(default_factory=list)
     reachable:  bool = True
+    # Actual host utilization (SSH /proc)
+    cpu_host_pct: float = 0.0
+    mem_host_pct: float = 0.0
+    mem_used_mb:  int   = 0
+    mem_total_mb: int   = 0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Global state
@@ -160,15 +208,109 @@ def fetch_host_vms(host_name: str, host_ip: str) -> Tuple[List[VMInfo], bool]:
     return vms, True
 
 
-def fetch_domjobinfo(host_ip: str, vm_name: str) -> Optional[Dict[str, str]]:
-    """Query migration progress. Returns None if not migrating."""
-    raw = _virsh(host_ip, "domjobinfo", vm_name, timeout=5)
-    if not raw or "No job" in raw:
+def fetch_domjobinfo(host_ip: str, vm_name: str,
+                     completed: bool = False) -> Optional[Dict[str, str]]:
+    """Query migration job info (active or --completed)."""
+    args = ("domjobinfo", "--completed", vm_name) if completed else ("domjobinfo", vm_name)
+    raw = _virsh(host_ip, *args, timeout=5)
+    if not raw or "No job" in raw or "no job" in raw.lower():
         return None
     info = _parse_kv(raw)
     if info.get("Job type", "None") in ("None", ""):
         return None
     return info
+
+
+def _parse_ms_field(s: str) -> Optional[int]:
+    """Parse virsh time fields like '42 ms' or '1,234 ms'."""
+    m = re.search(r"([\d,]+)\s*ms", s or "", re.IGNORECASE)
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def _ssh_script(host_ip: str, script: str, timeout: int = 10) -> str:
+    """Run a bash script on the host via SSH (same trust as virsh)."""
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+        f"root@{host_ip}", "bash", "-s",
+    ]
+    try:
+        r = subprocess.run(
+            cmd, input=script, capture_output=True, text=True, timeout=timeout
+        )
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+_HOST_UTIL_SCRIPT = r"""
+read -r _ u1 n1 s1 i1 iw1 irq1 sirq1 st1 idle1 rest </proc/stat
+t1=$((u1+n1+s1+i1+iw1+irq1+sirq1+st1+idle1+rest))
+i1t=$((i1+idle1+rest))
+sleep 0.35
+read -r _ u2 n2 s2 i2 iw2 irq2 sirq2 st2 idle2 rest </proc/stat
+t2=$((u2+n2+s2+i2+iw2+irq2+sirq2+st2+idle2+rest))
+i2t=$((i2+idle2+rest))
+dt=$((t2-t1)); di=$((i2t-i1t))
+cpu=0
+if [ "$dt" -gt 0 ]; then cpu=$(( (100 * (dt - di)) / dt )); fi
+mt=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+ma=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+echo "CPU_PCT=${cpu}"
+echo "MEM_TOTAL_KB=${mt}"
+echo "MEM_AVAIL_KB=${ma}"
+"""
+
+
+def fetch_host_utilization(host_ip: str) -> Tuple[float, float, int, int]:
+    """
+    Returns (cpu_pct, mem_pct, mem_used_mb, mem_total_mb).
+    cpu_pct is approximate host-wide utilization from /proc/stat delta.
+    """
+    raw = _ssh_script(host_ip, _HOST_UTIL_SCRIPT, timeout=12)
+    if not raw:
+        return 0.0, 0.0, 0, 0
+
+    vals: Dict[str, str] = {}
+    for line in raw.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            vals[k.strip()] = v.strip()
+
+    try:
+        cpu_pct = float(vals.get("CPU_PCT", "0"))
+        mt_kb = int(vals.get("MEM_TOTAL_KB", "0"))
+        ma_kb = int(vals.get("MEM_AVAIL_KB", "0"))
+    except ValueError:
+        return 0.0, 0.0, 0, 0
+
+    if mt_kb <= 0:
+        return cpu_pct, 0.0, 0, 0
+
+    used_kb = max(0, mt_kb - ma_kb)
+    mem_pct = used_kb * 100.0 / mt_kb
+    return (
+        max(0.0, min(100.0, cpu_pct)),
+        max(0.0, min(100.0, mem_pct)),
+        used_kb // 1024,
+        mt_kb // 1024,
+    )
+
+
+def _apply_domjob_to_mig(mig: MigrationJob, job: Dict[str, str]) -> None:
+    """Update migration job fields from virsh domjobinfo output."""
+    mig.data_total_b = _parse_bytes(job.get("Data total", "0"))
+    mig.data_proc_b  = _parse_bytes(job.get("Data processed", "0"))
+    dirty_m = re.search(
+        r"[\d,]+", job.get("Dirty rate", "0").replace(",", "")
+    )
+    mig.dirty_rate = int(dirty_m.group()) if dirty_m else 0
+
+    dt = _parse_ms_field(job.get("Downtime", ""))
+    if dt is not None:
+        mig.downtime_ms = dt
+    total_ms = _parse_ms_field(job.get("Total time", ""))
+    if total_ms is not None and total_ms > 0:
+        mig.elapsed = total_ms / 1000.0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Logging
@@ -185,17 +327,48 @@ def log(level: str, msg: str):
 #  Background update thread
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _finalize_migration(mig: MigrationJob, src_ip: str) -> bool:
+    """Pull Downtime / Total time from domjobinfo --completed. Returns True if newly finalized."""
+    with _lock:
+        if mig.completed:
+            return False
+
+    job = fetch_domjobinfo(src_ip, mig.vm_name, completed=True)
+    if job:
+        _apply_domjob_to_mig(mig, job)
+    if mig.elapsed <= 0:
+        mig.elapsed = time.time() - _mig_start_time
+
+    with _lock:
+        if mig.completed:
+            return False
+        mig.completed = True
+
+    dt_s = f"  downtime={mig.downtime_ms}ms" if mig.downtime_ms is not None else ""
+    log("OK", f"{mig.vm_name} migration complete ({mig.elapsed:.1f}s{dt_s})")
+    return True
+
+
 def _update_loop():
-    global active_mig
+    global active_mig  # noqa: PLW0603
     while running:
         for h_name, h_conf in HOSTS_CONFIG.items():
-            vms, ok = fetch_host_vms(h_name, h_conf["ip"])
+            ip = h_conf["ip"]
+            vms, ok = fetch_host_vms(h_name, ip)
+            cpu_h, mem_h, mu, mt = (0.0, 0.0, 0, 0)
+            if ok:
+                cpu_h, mem_h, mu, mt = fetch_host_utilization(ip)
+
             with _lock:
                 if h_name in hosts:
                     hosts[h_name].vms = vms
                     hosts[h_name].reachable = ok
+                    if ok:
+                        hosts[h_name].cpu_host_pct = cpu_h
+                        hosts[h_name].mem_host_pct = mem_h
+                        hosts[h_name].mem_used_mb  = mu
+                        hosts[h_name].mem_total_mb = mt
 
-        # Update migration progress
         with _lock:
             mig = active_mig
 
@@ -203,18 +376,13 @@ def _update_loop():
             src_ip = HOSTS_CONFIG[mig.src_host]["ip"]
             job = fetch_domjobinfo(src_ip, mig.vm_name)
             with _lock:
-                if job:
-                    active_mig.data_total_b = _parse_bytes(job.get("Data total", "0"))
-                    active_mig.data_proc_b  = _parse_bytes(job.get("Data processed", "0"))
-                    dirty_m = re.search(r"[\d,]+", job.get("Dirty rate", "0").replace(",", ""))
-                    active_mig.dirty_rate   = int(dirty_m.group()) if dirty_m else 0
-                else:
-                    # no job → completed
-                    if active_mig and not active_mig.completed:
-                        active_mig.completed = True
-                        active_mig.elapsed   = time.time() - _mig_start_time
-                        log("OK", f"{active_mig.vm_name} migration complete"
-                            f" ({active_mig.elapsed:.1f}s)")
+                if job and active_mig:
+                    _apply_domjob_to_mig(active_mig, job)
+                elif active_mig and not active_mig.completed:
+                    if _finalize_migration(active_mig, src_ip):
+                        with _lock:
+                            mig_history.append(active_mig)
+                            active_mig = None
 
         time.sleep(REFRESH_INTERVAL)
 
@@ -327,13 +495,19 @@ def run_load_balance():
     global bin_pack_plan
 
     with _lock:
-        snapshot = {n: (list(hs.vms), hs.cpu_cap, hs.mem_cap_mb)
-                    for n, hs in hosts.items()}
+        snapshot = {
+            n: (list(hs.vms), hs.cpu_cap, hs.mem_cap_mb, hs.cpu_host_pct)
+            for n, hs in hosts.items()
+        }
 
     overloaded = []
-    for h_name, (vms, cpu_cap, _) in snapshot.items():
-        used_cpu = sum(v.cpu for v in vms if v.state == "running")
-        if used_cpu / cpu_cap >= 0.80:
+    for h_name, (vms, cpu_cap, _, cpu_host_pct) in snapshot.items():
+        if cpu_host_pct > 0:
+            cpu_load = cpu_host_pct / 100.0
+        else:
+            used_cpu = sum(v.cpu for v in vms if v.state == "running")
+            cpu_load = used_cpu / cpu_cap if cpu_cap else 0
+        if cpu_load >= 0.80:
             overloaded.append(h_name)
 
     if not overloaded:
@@ -368,20 +542,28 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
         capture_output=True, text=True, timeout=600
     )
 
-    elapsed = time.time() - _mig_start_time
-
     with _lock:
-        if result.returncode == 0:
-            active_mig.completed = True
-            active_mig.elapsed   = elapsed
-            log("OK", f"{vm_name} done ✓  elapsed={elapsed:.1f}s")
-        else:
-            active_mig.failed    = True
-            active_mig.error_msg = result.stderr.strip()[:80]
-            log("ERR", f"{vm_name} failed: {active_mig.error_msg}")
+        mig = active_mig
 
-        mig_history.append(active_mig)
-        active_mig = None
+    if result.returncode == 0 and mig:
+        if _finalize_migration(mig, src_ip):
+            with _lock:
+                mig_history.append(mig)
+                active_mig = None
+        else:
+            with _lock:
+                if active_mig and active_mig.completed:
+                    mig_history.append(active_mig)
+                    active_mig = None
+    else:
+        with _lock:
+            if active_mig:
+                active_mig.failed = True
+                active_mig.error_msg = result.stderr.strip()[:80]
+                active_mig.elapsed = time.time() - _mig_start_time
+                log("ERR", f"{vm_name} failed: {active_mig.error_msg}")
+                mig_history.append(active_mig)
+                active_mig = None
 
 
 def execute_migrations():
@@ -433,28 +615,57 @@ def _make_bar(pct: float, width: int = 14, color: str = "blue") -> Text:
 def _render_host_panel(hs: HostState) -> Panel:
     color = HOST_COLORS.get(hs.name, "white")
 
-    used_cpu = sum(v.cpu    for v in hs.vms if v.state == "running")
-    used_mem = sum(v.mem_mb for v in hs.vms if v.state == "running")
-    cpu_pct  = used_cpu / hs.cpu_cap    * 100 if hs.cpu_cap    else 0
-    mem_pct  = used_mem / hs.mem_cap_mb * 100 if hs.mem_cap_mb else 0
+    alloc_cpu = sum(v.cpu    for v in hs.vms if v.state == "running")
+    alloc_mem = sum(v.mem_mb for v in hs.vms if v.state == "running")
+    cpu_alloc_pct = alloc_cpu / hs.cpu_cap * 100 if hs.cpu_cap else 0
+    mem_alloc_pct = alloc_mem / hs.mem_cap_mb * 100 if hs.mem_cap_mb else 0
+
+    cpu_host = hs.cpu_host_pct if hs.reachable else 0.0
+    mem_host = hs.mem_host_pct if hs.reachable else 0.0
+    has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
 
     grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=4)
-    grid.add_column(width=15)
-    grid.add_column(width=5, justify="right")
+    grid.add_column(width=5)
+    grid.add_column(width=13)
+    grid.add_column(width=11, justify="right")
 
-    grid.add_row(
-        Text("CPU", style="dim"),
-        _make_bar(cpu_pct, 14, color),
-        Text(f"{cpu_pct:.0f}%",
-             style=f"bold {'red' if cpu_pct >= 90 else color}")
-    )
-    grid.add_row(
-        Text("MEM", style="dim"),
-        _make_bar(mem_pct, 14, color),
-        Text(f"{mem_pct:.0f}%",
-             style=f"bold {'red' if mem_pct >= 90 else color}")
-    )
+    def pct_style(pct: float, base: str) -> str:
+        return f"bold {'red' if pct >= 90 else ('yellow' if pct >= 70 else base)}"
+
+    if has_host:
+        grid.add_row(
+            Text("CPU▲", style="bold white"),
+            _make_bar(cpu_host, 12, color),
+            Text(f"{cpu_host:.0f}% host", style=pct_style(cpu_host, color)),
+        )
+        grid.add_row(
+            Text("CPU◇", style="dim"),
+            _make_bar(cpu_alloc_pct, 12, "dim"),
+            Text(f"{cpu_alloc_pct:.0f}% alloc", style="dim"),
+        )
+        mem_label = f"{hs.mem_used_mb}/{hs.mem_total_mb}M"
+        grid.add_row(
+            Text("MEM▲", style="bold white"),
+            _make_bar(mem_host, 12, color),
+            Text(f"{mem_host:.0f}% {mem_label}", style=pct_style(mem_host, color)),
+        )
+        grid.add_row(
+            Text("MEM◇", style="dim"),
+            _make_bar(mem_alloc_pct, 12, "dim"),
+            Text(f"{mem_alloc_pct:.0f}% alloc", style="dim"),
+        )
+    else:
+        grid.add_row(
+            Text("CPU", style="dim"),
+            _make_bar(cpu_alloc_pct, 12, color),
+            Text(f"{cpu_alloc_pct:.0f}% alloc", style=pct_style(cpu_alloc_pct, color)),
+        )
+        grid.add_row(
+            Text("MEM", style="dim"),
+            _make_bar(mem_alloc_pct, 12, color),
+            Text(f"{mem_alloc_pct:.0f}% alloc", style=pct_style(mem_alloc_pct, color)),
+        )
+
     grid.add_row(Text(""), Text(""), Text(""))
 
     with _lock:
@@ -547,6 +758,12 @@ def _render_status_panel() -> Panel:
         stats.append("Precopy",     style="white")
         t.add_row(Text(""), stats)
 
+        if mig.downtime_ms is not None:
+            t.add_row(
+                Text("Downtime", style="dim"),
+                Text(f"{mig.downtime_ms} ms (live)", style="bold green"),
+            )
+
         return Panel(t, title="🚀 LIVE MIGRATION",
                      border_style="blue", box=box.ROUNDED)
 
@@ -570,6 +787,28 @@ def _render_status_panel() -> Panel:
                 Text("✓ Current placement is already optimal.", style="green"),
                 title="PLAN", border_style="dim", box=box.ROUNDED
             )
+
+    # ── Recent migration metrics ─────────────────────────────────────────────
+    with _lock:
+        recent = list(mig_history[-3:])
+
+    if recent and not mig:
+        hist = Table.grid(padding=(0, 1))
+        hist.add_column(width=10)
+        hist.add_column()
+        for j in reversed(recent):
+            line = Text()
+            line.append(f"{j.vm_name} ", style="bold")
+            line.append(f"{j.src_host}→{j.dst_host}  ", style="dim")
+            line.append(f"{j.elapsed:.1f}s", style="cyan")
+            if j.downtime_ms is not None:
+                line.append(f"  downtime ", style="dim")
+                line.append(f"{j.downtime_ms} ms", style="bold green")
+            elif j.failed:
+                line.append("  FAILED", style="bold red")
+            hist.add_row(Text("Last mig", style="dim"), line)
+        return Panel(hist, title="MIGRATION STATS",
+                     border_style="dim green", box=box.ROUNDED)
 
     # ── Idle ─────────────────────────────────────────────────────────────────
     t = Text()
@@ -613,8 +852,8 @@ def _build_layout() -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="hosts",  size=11),
-        Layout(name="status", size=7),
+        Layout(name="hosts",  size=14),
+        Layout(name="status", size=8),
         Layout(name="log",    size=10),
         Layout(name="footer", size=1),
     )
