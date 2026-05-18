@@ -208,9 +208,11 @@ virsh domjobinfo --completed <vm-name>
 ### 수동 migration (보조)
 
 ```bash
-virsh migrate --live --persistent --undefinesource \
+virsh migrate --live --persistent --undefinesource --unsafe \
     vm-5 qemu+ssh://root@serverc/system
 ```
+
+(`--unsafe`: NFS 공유 디스크인데 libvirt 9+가 shared storage로 인식 못 할 때 필요)
 
 ---
 
@@ -242,6 +244,7 @@ virsh migrate --live --persistent --undefinesource \
 | B/C SSH 실패 | `ls .../hw6/keys/*.pub` 3개인지, B/C `setup_sub` 재실행 |
 | 대시보드 호스트 빨강 | `cluster.conf` IP = 실제 NIC IP |
 | Migration storage 오류 | B/C에 `mount \| grep libvirt` 요청 |
+| `Unsafe migration` / shared storage | B/C NFS 마운트 확인 후 `--unsafe` 사용 (스크립트·대시보드 반영됨) |
 | NFS 문제 | `systemctl status nfs-server`, `exportfs -v` |
 
 환경 변수: `HW6_SKIP_SSH_WAIT=1`, `HW6_ROOT_PASSWORD=...` (3대 동일 root PW 시)

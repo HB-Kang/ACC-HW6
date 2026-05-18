@@ -535,9 +535,10 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
 
     log("MIG", f"{vm_name}: {src_host} → {dst_host} migration started")
 
+    # --unsafe: NFS-backed disks at the same path; libvirt 9+ may not auto-detect shared storage
     result = subprocess.run(
         ["virsh", "-c", f"qemu+ssh://root@{src_ip}/system",
-         "migrate", "--live", "--persistent", "--undefinesource",
+         "migrate", "--live", "--persistent", "--undefinesource", "--unsafe",
          vm_name, f"qemu+ssh://root@{dst_ip}/system"],
         capture_output=True, text=True, timeout=600
     )

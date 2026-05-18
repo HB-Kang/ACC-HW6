@@ -296,6 +296,22 @@ hw6_make_cidata_iso() {
     return 1
 }
 
+# Live migration (NFS shared qcow2 at /var/lib/libvirt/images on all hosts).
+# libvirt 9+ may not treat NFS file disks as "shared" — --unsafe is required for this lab.
+hw6_virsh_migrate_live() {
+    local vm_name="$1"
+    local dest_uri="$2"
+    virsh migrate --live --persistent --undefinesource --unsafe \
+        "$vm_name" "$dest_uri"
+}
+
+hw6_check_nfs_shared_storage() {
+    local path="${1:-$HW6_NFS_DIR}"
+    mount | grep -q " on ${path} " && return 0
+    mount | grep -q "${path}" && return 0
+    return 1
+}
+
 hw6_sshd_lab_config() {
     local dropin="/etc/ssh/sshd_config.d/99-hw6-lab.conf"
     cat > "$dropin" << 'EOF'
