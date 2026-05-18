@@ -35,12 +35,16 @@ Usage
 
 Keys: [r] Bin Packing  [c] Consolidate (C Idle)  [l] Load balance  [m] Migrate  [q] Quit
 
+4K / flicker: optional  HW6_DASH_WIDTH=120  HW6_DASH_REFRESH_SEC=1.5  HW6_DASH_ALT_SCREEN=0
+
 Platform
 --------
   Not supported on native Windows (needs termios/tty + virsh over SSH).
   Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
+import os
+import shutil
 import subprocess
 import threading
 import time
@@ -88,8 +92,13 @@ HW6_CONFIG_PATHS = (
 
 HOSTS_CONFIG: Dict[str, dict] = {}
 
-REFRESH_INTERVAL = 1.5   # seconds (poll interval)
+REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 LOG_MAX_LINES    = 6     # max log lines displayed
+# TUI: cap size on 4K terminals (full-width redraws flash); tune with env vars
+DASH_MAX_WIDTH   = int(os.environ.get("HW6_DASH_WIDTH", "120"))
+DASH_MAX_HEIGHT  = int(os.environ.get("HW6_DASH_HEIGHT", "44"))
+DASH_REDRAW_SEC  = float(os.environ.get("HW6_DASH_REFRESH_SEC", "1.0"))
+DASH_ALT_SCREEN  = os.environ.get("HW6_DASH_ALT_SCREEN", "1") != "0"
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -611,7 +620,17 @@ def execute_migrations():
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-console = Console()
+def _make_console() -> Console:
+    """Fixed layout size — avoids 4K-wide full terminal clears that flicker."""
+    tw, th = shutil.get_terminal_size(fallback=(DASH_MAX_WIDTH, DASH_MAX_HEIGHT))
+    return Console(
+        width=min(tw, DASH_MAX_WIDTH),
+        height=min(th, DASH_MAX_HEIGHT),
+        force_terminal=True,
+    )
+
+
+console = _make_console()
 
 
 def _make_bar(pct: float, width: int = 14, color: str = "blue") -> Text:
@@ -856,7 +875,7 @@ def _render_log_panel() -> Panel:
             Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
             Text(msg)
         )
-    grid.add_row("", "", Text("█", style="dim blink"))
+    grid.add_row("", "", Text("▌", style="dim"))
 
     return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
 
@@ -1033,13 +1052,19 @@ def main():
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        with Live(layout, console=console,
-                  refresh_per_second=2, screen=True):
+        with Live(
+            layout,
+            console=console,
+            screen=DASH_ALT_SCREEN,
+            transient=True,
+            auto_refresh=False,
+            refresh_per_second=4,
+        ) as live:
             while running:
                 _render(layout)
+                live.refresh()
 
-                # Key input within 0.5s
-                if select.select([sys.stdin], [], [], 0.5)[0]:
+                if select.select([sys.stdin], [], [], DASH_REDRAW_SEC)[0]:
                     key = sys.stdin.read(1)
                     if key in ("q", "\x03"):   # q or Ctrl+C
                         running = False

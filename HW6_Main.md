@@ -174,6 +174,15 @@ python3 migration_dashboard.py
 
 (`/etc/hw6/cluster.conf` IP 자동 사용)
 
+**4K·깜빡임:** 터미널이 너무 크면 전체 화면을 자주 지워서 번쩍거릴 수 있습니다. 기본은 폭 120칸·1초 갱신입니다. 더 줄이려면:
+
+```bash
+export HW6_DASH_WIDTH=100 HW6_DASH_REFRESH_SEC=1.5 HW6_DASH_ALT_SCREEN=0
+python3 migration_dashboard.py
+```
+
+(`HW6_DASH_ALT_SCREEN=0` — alternate screen 끔, 스크롤은 남을 수 있음)
+
 | 키 | 동작 | Case |
 |----|------|------|
 | `c` | Consolidation (Host-C Idle) | **Case 1** |
