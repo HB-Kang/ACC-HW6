@@ -41,6 +41,7 @@ Platform
   Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
+import shutil
 import subprocess
 import threading
 import time
@@ -87,12 +88,17 @@ HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 UI_REFRESH_SEC   = 1.0   # keyboard poll interval
-# SSH terminal 209×41 — 2-column UI: hosts (left) | status+log (right)
+# SSH terminal 209×41 (leave 2 cols margin — avoids | border wrap on column 209)
 TERM_COLS = 209
 TERM_ROWS = 41
-LOG_MAX_LINES      = 12
-VM_LINES_PER_HOST  = 3
-HOST_BAR_WIDTH     = 36   # full-width panel (~209 cols)
+TERM_MARGIN = 2
+LOG_MAX_LINES = 12
+VM_LINES_PER_HOST = 3
+
+# Updated each frame in _refresh_ui_width()
+_ui_safe_cols = TERM_COLS - TERM_MARGIN
+_ui_inner_cols = _ui_safe_cols - 4
+_ui_bar_width = 28
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -614,18 +620,52 @@ def execute_migrations():
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Width fixed to 209; height follows terminal (fixed height clips panels)
-console = Console(width=TERM_COLS, force_terminal=True)
+console: Console = Console(width=_ui_safe_cols, force_terminal=True)
 
 
-def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> Text:
-    """Build a text progress bar."""
-    pct   = max(0.0, min(100.0, pct))
-    fill  = int(pct / 100 * width)
-    c     = "red" if pct >= 90 else ("yellow" if pct >= 70 else color)
+def _refresh_ui_width() -> None:
+    """Fit inside real terminal — never draw into last column (MobaXterm wrap)."""
+    global console, _ui_safe_cols, _ui_inner_cols, _ui_bar_width
+    tw, _ = shutil.get_terminal_size(fallback=(TERM_COLS, TERM_ROWS))
+    _ui_safe_cols = min(tw, TERM_COLS) - TERM_MARGIN
+    _ui_inner_cols = max(40, _ui_safe_cols - 4)
+    _ui_bar_width = max(10, _ui_inner_cols - 30)
+    console = Console(width=_ui_safe_cols, force_terminal=True)
+
+
+def _hw6_panel(
+    renderable,
+    *,
+    title: str = "",
+    border_style: str = "white",
+) -> Panel:
+    return Panel(
+        renderable,
+        title=title,
+        border_style=border_style,
+        box=box.ASCII,
+        width=_ui_safe_cols,
+        expand=False,
+        padding=(0, 1),
+    )
+
+
+def _clip_str(s: str, max_len: Optional[int] = None) -> str:
+    limit = max_len if max_len is not None else _ui_inner_cols
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 3)] + "..."
+
+
+def _make_bar(pct: float, width: Optional[int] = None, color: str = "blue") -> Text:
+    """ASCII bar (#.) — unicode blocks can be 2 cells wide and break right edge."""
+    w = width if width is not None else _ui_bar_width
+    pct = max(0.0, min(100.0, pct))
+    fill = int(pct / 100 * w)
+    c = "red" if pct >= 90 else ("yellow" if pct >= 70 else color)
     t = Text()
-    t.append("█" * fill,           style=f"bold {c}")
-    t.append("░" * (width - fill), style="dim")
+    t.append("#" * fill, style=f"bold {c}")
+    t.append("." * (w - fill), style="dim")
     return t
 
 
@@ -646,10 +686,12 @@ def _append_metric_line(
     suffix: str = "",
     dim: bool = False,
 ) -> None:
-    """One line: label + bar + % (left to right — no Table columns)."""
+    """One line: label + bar + % (fits _ui_inner_cols)."""
+    overhead = 5 + 1 + 1 + 4 + len(suffix)
+    bw = min(bar_width, max(8, _ui_inner_cols - overhead))
     body.append(f"{label:<5}", style="dim" if dim else "bold white")
     body.append(" ")
-    body.append_text(_make_bar(pct, bar_width, color if not dim else "dim"))
+    body.append_text(_make_bar(pct, bw, color if not dim else "dim"))
     body.append(f" {pct:4.0f}%", style="dim" if dim else _pct_style(pct, color))
     if suffix:
         body.append(suffix, style="dim")
@@ -659,9 +701,11 @@ def _append_metric_line(
 def _render_host_panel(
     hs: HostState,
     *,
-    bar_width: int = HOST_BAR_WIDTH,
+    bar_width: Optional[int] = None,
     vm_max: int = VM_LINES_PER_HOST,
 ) -> Panel:
+    if bar_width is None:
+        bar_width = _ui_bar_width
     color = HOST_COLORS.get(hs.name, "white")
 
     alloc_cpu = sum(v.cpu    for v in hs.vms if v.state == "running")
@@ -701,20 +745,18 @@ def _render_host_panel(
                 icon, ic, label = "*", "green", "running"
             else:
                 icon, ic, label = "-", "dim", vm.state[:8]
-            body.append(
-                f" {icon} {vm.name:<8} {vm.cpu}c {vm.mem_mb // 1024:>2}G  {label}\n",
-                style=ic,
+            line = _clip_str(
+                f" {icon} {vm.name:<8} {vm.cpu}c {vm.mem_mb // 1024:>2}G  {label}"
             )
+            body.append(line + "\n", style=ic)
         if len(hs.vms) > vm_max:
             body.append(f" +{len(hs.vms) - vm_max} more VM(s)\n", style="dim")
 
     border = "red" if not hs.reachable else color
-    return Panel(
+    return _hw6_panel(
         body,
         title=f"[bold {color}]{hs.name}[/] [dim]{hs.ip}[/dim]",
         border_style=border,
-        box=box.ROUNDED,
-        padding=(0, 1),
     )
 
 
@@ -730,10 +772,10 @@ def _render_status_panel() -> Panel:
         mb_proc  = mig.data_proc_b  / 1024 / 1024
         mb_total = mig.data_total_b / 1024 / 1024
 
-        bar_w = min(80, TERM_COLS - 40)
+        bar_w = max(10, _ui_inner_cols - 24)
         t = Text()
         t.append("MIGRATING  ", style="bold cyan")
-        t.append(f"{mig.vm_name}  {mig.src_host} -> {mig.dst_host}\n", style="bold white")
+        t.append(_clip_str(f"{mig.vm_name}  {mig.src_host} -> {mig.dst_host}") + "\n", style="bold white")
         t.append("Progress   ", style="dim")
         t.append_text(_make_bar(pct, bar_w, "blue"))
         t.append(f" {pct:.0f}%\n", style="bold cyan")
@@ -743,32 +785,31 @@ def _render_status_panel() -> Panel:
         t.append(f"{mig.dirty_rate:,} pages/s  Precopy\n", style=f"bold {dirty_c}")
         if mig.downtime_ms is not None:
             t.append(f"Downtime   {mig.downtime_ms} ms\n", style="bold green")
-        return Panel(t, title="LIVE MIGRATION", border_style="blue",
-                     box=box.ROUNDED, padding=(0, 1))
+        return _hw6_panel(t, title="LIVE MIGRATION", border_style="blue")
 
     # ── Bin Packing plan ready ─────────────────────────────────────────────────
     if plan:
         with _lock:
             current = {v.name: v.host
                        for hs in hosts.values() for v in hs.vms}
-        moves = [f"{vm} {current.get(vm,'?')} → {tgt}"
+        moves = [f"{vm} {current.get(vm,'?')} -> {tgt}"
                  for vm, tgt in plan.items()
                  if current.get(vm) != tgt]
         if moves:
             t = Text()
-            t.append("✦ Bin Packing complete  ", style="bold yellow")
+            t.append("* Bin Packing complete  ", style="bold yellow")
             t.append(f"{len(moves)} VM(s) to relocate  ", style="white")
             t.append("press [m] to run", style="dim")
             line = "  |  ".join(moves[:3])
             if len(moves) > 3:
                 line += f"  |  +{len(moves) - 3} more"
-            t.append("\n\n" + line[:90], style="cyan")
-            return Panel(t, title="PLAN", border_style="yellow",
-                         box=box.ROUNDED, padding=(0, 1))
+            t.append("\n\n" + _clip_str(line), style="cyan")
+            return _hw6_panel(t, title="PLAN", border_style="yellow")
         else:
-            return Panel(
+            return _hw6_panel(
                 Text("Current placement is already optimal.", style="green"),
-                title="PLAN", border_style="dim", box=box.ROUNDED, padding=(0, 1),
+                title="PLAN",
+                border_style="dim",
             )
 
     # ── Recent migration metrics ─────────────────────────────────────────────
@@ -778,14 +819,15 @@ def _render_status_panel() -> Panel:
     if recent and not mig:
         hist = Text()
         for j in reversed(recent):
-            hist.append(f"{j.vm_name} {j.src_host}->{j.dst_host} {j.elapsed:.1f}s", style="bold")
+            hist.append(_clip_str(
+                f"{j.vm_name} {j.src_host}->{j.dst_host} {j.elapsed:.1f}s"
+            ), style="bold")
             if j.downtime_ms is not None:
                 hist.append(f"  dt {j.downtime_ms}ms", style="green")
             elif j.failed:
                 hist.append("  FAILED", style="bold red")
             hist.append("\n")
-        return Panel(hist, title="MIGRATION STATS", border_style="dim green",
-                     box=box.ROUNDED, padding=(0, 1))
+        return _hw6_panel(hist, title="MIGRATION STATS", border_style="green")
 
     t = Text()
     t.append("Idle — ", style="dim")
@@ -793,7 +835,7 @@ def _render_status_panel() -> Panel:
     t.append("[c] C-idle  ", style="dim")
     t.append("[l] balance  ", style="dim")
     t.append("[m] migrate", style="dim")
-    return Panel(t, title="STATUS", border_style="dim", box=box.ROUNDED, padding=(0, 1))
+    return _hw6_panel(t, title="STATUS", border_style="dim")
 
 
 def _render_log_panel() -> Panel:
@@ -809,54 +851,44 @@ def _render_log_panel() -> Panel:
     with _lock:
         lines = list(log_lines[-LOG_MAX_LINES:])
 
-    msg_w = TERM_COLS - 22
     for ts, lvl, msg in lines:
-        if len(msg) > msg_w:
-            msg = msg[: msg_w - 1] + "…"
+        msg = _clip_str(msg, _ui_inner_cols - 16)
         body.append(f"{ts} ", style="dim")
         body.append(f"[{lvl}] ", style=LEVEL_STYLE.get(lvl, "white"))
         body.append(f"{msg}\n")
     if not lines:
         body.append("(no messages yet)\n", style="dim")
-    return Panel(body, title="LOG", border_style="dim", box=box.ROUNDED, padding=(0, 1))
+    return _hw6_panel(body, title="LOG", border_style="dim")
 
 
-def _footer_text() -> Text:
-    footer = Text(justify="center")
-    for key, desc in (
-        ("[r]", "BinPack"),
-        ("[c]", "C-idle"),
-        ("[l]", "LoadBal"),
-        ("[m]", "Migrate"),
-        ("[q]", "Quit"),
-    ):
-        footer.append(key, style="bold yellow")
-        footer.append(f" {desc}  ", style="dim")
-    footer.append(time.strftime("%H:%M:%S"), style="dim")
-    return footer
+def _footer_line() -> str:
+    parts = ["[r] BinPack", "[c] C-idle", "[l] LoadBal", "[m] Migrate", "[q] Quit",
+             time.strftime("%H:%M:%S")]
+    return _clip_str("   ".join(parts), _ui_safe_cols)
 
 
 def _draw_dashboard() -> None:
-    """209×41 — single column, each line label+bar+% left-to-right (SSH-safe)."""
+    """209×41 — ASCII boxes, width-2 margin so right | does not wrap."""
+    global console
+    _refresh_ui_width()
     console.clear(home=True)
 
-    console.print(Panel(
+    console.print(_hw6_panel(
         Align.center(Text("HW6 Live Migration Dashboard", style="bold cyan")),
-        box=box.HEAVY,
         border_style="blue",
-        padding=(0, 1),
     ))
 
     with _lock:
         host_states = dict(hosts)
 
-    kw = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
     for hname in ("Host-A", "Host-B", "Host-C"):
         console.print(_render_host_panel(
-            host_states.get(hname, HostState(hname, "", 8, 16384, reachable=False)), **kw))
+            host_states.get(hname, HostState(hname, "", 8, 16384, reachable=False)),
+            vm_max=VM_LINES_PER_HOST,
+        ))
     console.print(_render_status_panel())
     console.print(_render_log_panel())
-    console.print(Align.center(_footer_text()))
+    console.print(Align.center(Text(_footer_line()), width=_ui_safe_cols))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Key handling
