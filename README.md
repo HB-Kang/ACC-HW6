@@ -4,6 +4,29 @@
 강형빈 · 정선미 · 정윤민  
 제출 마감: **2026년 5월 19일 13:50**
 
+저장소: https://github.com/HB-Kang/ACC-HW6
+
+---
+
+## 누가 어떤 문서를 읽나요?
+
+| 담당 | PC | **읽을 문서** |
+|------|-----|----------------|
+| **팀원 A** | Host-A · `servera` | **[HW6_Main.md](HW6_Main.md)** ← 설치 + VM + 실험 전부 |
+| **팀원 B** | Host-B · `serverb` | **[HW6_Sub.md](HW6_Sub.md)** ← 설치 + 실험 때 할 일 |
+| **팀원 C** | Host-C · `serverc` | **[HW6_Sub.md](HW6_Sub.md)** ← 설치 + 실험 때 할 일 |
+| **팀 전체** (순서·합의만) | — | [HW6_전체가이드.md](HW6_전체가이드.md) |
+
+> A는 Sub 문서를, B/C는 Main 문서를 **읽을 필요 없습니다.**
+
+---
+
+## 진행 순서 (한 줄)
+
+```
+D값 합의 + NIC IP  →  A: setup_main  →  B,C: setup_sub  →  A: create_vms + 대시보드
+```
+
 ---
 
 ## 파일 구성
@@ -11,24 +34,15 @@
 ```
 ACC/
 ├── README.md
-├── HW6_사전검증.md    # VirtualBox: 스크립트 설치 + 오퍼레이터 Migration까지
-├── HW6_설치.md        # Bare metal 실제 설치
-├── HW6_실험.md        # Bare metal Case 1~3 시연·측정
-├── setup_main.sh
-├── setup_sub.sh
-├── create_vms.sh
-└── migration_dashboard.py
+├── HW6_전체가이드.md    # 팀: 타임라인·합의만
+├── HW6_Main.md          # 팀원 A 전용
+├── HW6_Sub.md           # 팀원 B·C 전용
+├── hw6_config.sh
+├── setup_main.sh        # A만 실행
+├── setup_sub.sh         # B·C만 실행
+├── create_vms.sh        # A만 실행
+└── migration_dashboard.py   # A만 실행
 ```
-
----
-
-## 진행 순서
-
-| 순서 | 문서 | 환경 | 내용 |
-|------|------|------|------|
-| 1 | [HW6_사전검증.md](HW6_사전검증.md) | **VirtualBox** | VM·네트워크 → `setup_*.sh` / `create_vms.sh` → 대시보드 `r`/`c`/`l`/`m`로 Migration 검증 |
-| 2 | [HW6_설치.md](HW6_설치.md) | **Bare metal** | 동일 스크립트로 물리 3호스트 설치 |
-| 3 | [HW6_실험.md](HW6_실험.md) | **Bare metal** | stress-ng + Case 1~3 시연, Downtime·제출 자료 |
 
 ---
 
@@ -42,4 +56,6 @@ ACC/
 
 ## 트러블슈팅
 
-상세는 [HW6_사전검증.md — 트러블슈팅](HW6_사전검증.md#트러블슈팅)
+- A: [HW6_Main.md §6](HW6_Main.md#6-a-트러블슈팅)
+- B/C: [HW6_Sub.md §5](HW6_Sub.md#5-bc-트러블슈팅)
+- 팀 공통: [HW6_전체가이드.md §7](HW6_전체가이드.md#7-트러블슈팅-요약)
