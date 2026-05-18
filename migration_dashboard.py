@@ -41,6 +41,7 @@ Platform
   Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -99,6 +100,12 @@ ROW_MARGIN = 2    # never fill to physical bottom row
 LOG_MAX_LINES = 24
 VM_LINES_PER_HOST = 6
 HOST_BAR_WIDTH = 60     # default; overridden each frame from actual panel width
+
+# Migration bandwidth cap (MiB/s).  At full speed a B->A migration can burst
+# to 400-900 Mbps and starve the Xshell SSH session on the same switch port,
+# causing the screen to freeze.  50 MiB/s ≈ 400 Mbps leaves plenty of headroom
+# on a 1 GbE lab network.  Set to 0 to disable the cap.
+MIG_BANDWIDTH_MIBPS = 50
 
 # Filled in main() from actual terminal size
 _ui: Dict[str, int] = {}
@@ -616,6 +623,8 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
         "--live", "--persistent", "--undefinesource", "--unsafe",
         "--migrateuri", mig_tcp,
     ]
+    if MIG_BANDWIDTH_MIBPS > 0:
+        mig_flags += ["--bandwidth", str(MIG_BANDWIDTH_MIBPS)]
 
     with _lock:
         active_mig      = MigrationJob(vm_name=vm_name,
@@ -842,7 +851,12 @@ def _fit_line(s: str, width: int) -> str:
 
 
 def _present(layout: Layout, width: int, height: int) -> None:
-    """Paint exactly `height` rows at absolute cursor positions (raw-tty safe)."""
+    """Paint exactly `height` rows at absolute cursor positions (raw-tty safe).
+
+    Uses non-blocking I/O for the write so that network congestion (e.g., the
+    migration stream saturating the link) never causes sys.stdout.write to
+    block indefinitely and freeze the whole dashboard.
+    """
     with console.capture() as capture:
         console.print(layout, width=width, height=height, overflow="crop")
     lines = capture.get().splitlines()
@@ -854,8 +868,18 @@ def _present(layout: Layout, width: int, height: int) -> None:
         out.append(f"\033[{i + 1};1H")     # row=i+1, col=1 (absolute)
         out.append(_fit_line(raw, width))
         out.append("\033[K")               # erase any leftover chars to row end
-    sys.stdout.write("".join(out))
-    sys.stdout.flush()
+
+    payload = "".join(out).encode("utf-8", errors="replace")
+    fd = sys.stdout.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        try:
+            os.write(fd, payload)
+        except BlockingIOError:
+            pass   # skip this frame — SSH pipe full (network congestion); try next tick
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl)  # always restore blocking mode
 
 
 def _footer_plain() -> str:
