@@ -226,7 +226,8 @@ sudo bash hw6_diag_migration.sh    # Host-A에서 실행
 ```
 
 - C가 **VirtualBox VM**이면 Nested VT-x/AMD-V 켜기 (없으면 QEMU가 C에서 바로 죽음)
-- `serverc.hw6.local` → **C의 실제 IP** 로 풀려야 함 (`getent hosts $(hostname -f)`)
+- `serverc.hw6.local` → **IPv4** (`192.168.0.x`) 로 풀려야 함 — `getent` 가 v6만 보이면 `setup_sub.sh` 재실행 (`/etc/gai.conf` IPv4 우선)
+- 진단에서 Host-A **NFS not mounted** 는 정상 (A는 NFS **서버**, export만 확인)
 
 ---
 

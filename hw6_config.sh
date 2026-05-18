@@ -193,6 +193,33 @@ hw6_cluster_ip_for_short() {
     esac
 }
 
+# Migration uses 192.168.0.x only — avoid getent returning IPv6 first
+hw6_resolve_ipv4() {
+    local name="${1:-$(hostname -f)}"
+    local ip=""
+
+    ip="$(getent ahostsv4 "$name" 2>/dev/null | awk '$2 == "STREAM" { print $1; exit }')"
+    if [[ -z "$ip" ]]; then
+        ip="$(getent hosts "$name" 2>/dev/null \
+            | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1; exit }')"
+    fi
+    [[ -n "$ip" ]] && echo "$ip"
+}
+
+hw6_prefer_ipv4_gai() {
+    local gai="/etc/gai.conf"
+    touch "$gai"
+    if grep -q 'BEGIN HW6' "$gai" 2>/dev/null; then
+        return 0
+    fi
+    cat >> "$gai" << 'EOF'
+
+# BEGIN HW6 — prefer IPv4 for libvirt / getent (lab uses 192.168.0.0/24)
+precedence ::ffff:0:0/96  100
+# END HW6
+EOF
+}
+
 # QEMU advertises this address for incoming migration (avoids wrong NIC / localhost on C)
 hw6_configure_libvirt_migration() {
     local ip="$1"
@@ -254,6 +281,17 @@ fi
 install -m 644 "${tmp}.new" "$hf"
 rm -f "$tmp" "${tmp}.new"
 
+gai="/etc/gai.conf"
+touch "$gai"
+if ! grep -q 'BEGIN HW6' "$gai" 2>/dev/null; then
+    cat >> "$gai" << 'GAIE'
+
+# BEGIN HW6 — prefer IPv4 for libvirt / getent (lab uses 192.168.0.0/24)
+precedence ::ffff:0:0/96  100
+# END HW6
+GAIE
+fi
+
 qconf="/etc/libvirt/qemu.conf"
 [[ -f "$qconf" ]] || exit 1
 if grep -qE '^#?migration_host' "$qconf"; then
@@ -263,9 +301,12 @@ else
 fi
 systemctl try-restart libvirtd 2>/dev/null || systemctl restart libvirtd
 
-resolved="$(getent hosts "$(hostname -f)" | awk '{print $1}' | head -1)"
+resolved="$(getent ahostsv4 "$(hostname -f)" 2>/dev/null | awk '$2 == "STREAM" { print $1; exit }')"
+if [[ -z "$resolved" ]]; then
+    resolved="$(getent hosts "$(hostname -f)" | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1; exit }')"
+fi
 if [[ -z "$resolved" || "$resolved" == "127.0.0.1" || "$resolved" != "$myip" ]]; then
-    echo "hostname broken: $(hostname -f) -> ${resolved:-?} (want ${myip})"
+    echo "hostname broken (need IPv4 ${myip}): $(hostname -f) -> ${resolved:-?}"
     exit 1
 fi
 EOS
@@ -344,9 +385,10 @@ hw6_configure_cluster_hostname() {
 
     hw6_fix_loopback_hosts
     hw6_hosts_inject
+    hw6_prefer_ipv4_gai
     hw6_configure_libvirt_migration "$(hw6_cluster_ip_for_short "$short")"
 
-    ok_cb "Hostname: $(hostname -f) (migration FQDN)"
+    ok_cb "Hostname: $(hostname -f) → $(hw6_resolve_ipv4) (IPv4)"
 }
 
 hw6_update_hosts_file() {
@@ -456,20 +498,25 @@ hw6_migration_preflight() {
         return 1
     fi
 
-    rc=0
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${short}" bash -s -- "$path" "$ip" <<'EOS' || rc=$?
+    if [[ "$short" == "servera" ]]; then
+        systemctl is-active --quiet nfs-server || { warn_cb "nfs-server not active on Host-A"; return 1; }
+        exportfs -v 2>/dev/null | grep -q "${path}" || { warn_cb "NFS export missing for ${path}"; return 1; }
+    else
+        rc=0
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "root@${short}" bash -s -- "$path" "$ip" <<'EOS' || rc=$?
 path="$1"
 want_ip="$2"
 systemctl is-active --quiet libvirtd || { echo "libvirtd not active"; exit 1; }
 mount | grep -q " on ${path} " || mount | grep -q "${path}" || { echo "NFS not mounted at ${path}"; exit 1; }
 test -w "${path}" || { echo "NFS path not writable: ${path}"; exit 1; }
-resolved="$(getent hosts "$(hostname -f)" | awk '{print $1}' | head -1)"
-[[ -n "$resolved" && "$resolved" != "127.0.0.1" ]] || { echo "hostname -f resolves to localhost"; exit 1; }
+resolved="$(getent ahostsv4 "$(hostname -f)" 2>/dev/null | awk '$2 == "STREAM" { print $1; exit }')"
+[[ -z "$resolved" ]] && resolved="$(getent hosts "$(hostname -f)" | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1; exit }')"
+[[ "$resolved" == "$want_ip" ]] || { echo "FQDN not IPv4 ${want_ip}: got ${resolved:-?}"; exit 1; }
 EOS
-
-    if [[ $rc -ne 0 ]]; then
-        warn_cb "Preflight ${short} failed (NFS/libvirtd/FQDN) — fix Host-${short^^} then retry"
-        return 1
+        if [[ $rc -ne 0 ]]; then
+            warn_cb "Preflight ${short} failed (NFS/libvirtd/IPv4 FQDN)"
+            return 1
+        fi
     fi
 
     hw6_remote_repair_migration_target "$short" || {
