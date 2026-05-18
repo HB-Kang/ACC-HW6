@@ -68,10 +68,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from rich.columns import Columns
-from rich.console import Console, Group
+from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 from rich.align import Align
 from rich import box
@@ -94,7 +92,7 @@ TERM_COLS = 209
 TERM_ROWS = 41
 LOG_MAX_LINES      = 12
 VM_LINES_PER_HOST  = 3
-HOST_BAR_WIDTH     = 22   # per host panel in left column (~100 cols)
+HOST_BAR_WIDTH     = 36   # full-width panel (~209 cols)
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -631,6 +629,33 @@ def _make_bar(pct: float, width: int = HOST_BAR_WIDTH, color: str = "blue") -> T
     return t
 
 
+def _pct_style(pct: float, base: str) -> str:
+    if pct >= 90:
+        return "bold red"
+    if pct >= 70:
+        return "bold yellow"
+    return f"bold {base}"
+
+
+def _append_metric_line(
+    body: Text,
+    label: str,
+    pct: float,
+    bar_width: int,
+    color: str,
+    suffix: str = "",
+    dim: bool = False,
+) -> None:
+    """One line: label + bar + % (left to right — no Table columns)."""
+    body.append(f"{label:<5}", style="dim" if dim else "bold white")
+    body.append(" ")
+    body.append_text(_make_bar(pct, bar_width, color if not dim else "dim"))
+    body.append(f" {pct:4.0f}%", style="dim" if dim else _pct_style(pct, color))
+    if suffix:
+        body.append(suffix, style="dim")
+    body.append("\n")
+
+
 def _render_host_panel(
     hs: HostState,
     *,
@@ -648,84 +673,44 @@ def _render_host_panel(
     mem_host = hs.mem_host_pct if hs.reachable else 0.0
     has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
 
-    grid = Table.grid(padding=(0, 0))
-    grid.add_column(width=5)
-    grid.add_column(width=bar_width + 1)
-    grid.add_column(width=11, justify="right")
-
-    def pct_style(pct: float, base: str) -> str:
-        return f"bold {'red' if pct >= 90 else ('yellow' if pct >= 70 else base)}"
-
+    body = Text()
     if has_host:
-        grid.add_row(
-            Text("CPU▲", style="bold white"),
-            _make_bar(cpu_host, bar_width, color),
-            Text(f"{cpu_host:.0f}% host", style=pct_style(cpu_host, color)),
-        )
-        grid.add_row(
-            Text("CPU◇", style="dim"),
-            _make_bar(cpu_alloc_pct, bar_width, "dim"),
-            Text(f"{cpu_alloc_pct:.0f}% alloc", style="dim"),
-        )
-        mem_label = f"{hs.mem_used_mb}/{hs.mem_total_mb}M"
-        grid.add_row(
-            Text("MEM▲", style="bold white"),
-            _make_bar(mem_host, bar_width, color),
-            Text(f"{mem_host:.0f}% {mem_label}", style=pct_style(mem_host, color)),
-        )
-        grid.add_row(
-            Text("MEM◇", style="dim"),
-            _make_bar(mem_alloc_pct, bar_width, "dim"),
-            Text(f"{mem_alloc_pct:.0f}% alloc", style="dim"),
-        )
+        _append_metric_line(body, "CPU h", cpu_host, bar_width, color, " host")
+        _append_metric_line(body, "CPU a", cpu_alloc_pct, bar_width, color, " alloc", dim=True)
+        mem_sfx = f" ({hs.mem_used_mb}/{hs.mem_total_mb}M)"
+        _append_metric_line(body, "MEM h", mem_host, bar_width, color, mem_sfx)
+        _append_metric_line(body, "MEM a", mem_alloc_pct, bar_width, color, " alloc", dim=True)
     else:
-        grid.add_row(
-            Text("CPU", style="dim"),
-            _make_bar(cpu_alloc_pct, bar_width, color),
-            Text(f"{cpu_alloc_pct:.0f}% alloc", style=pct_style(cpu_alloc_pct, color)),
-        )
-        grid.add_row(
-            Text("MEM", style="dim"),
-            _make_bar(mem_alloc_pct, bar_width, color),
-            Text(f"{mem_alloc_pct:.0f}% alloc", style=pct_style(mem_alloc_pct, color)),
-        )
+        _append_metric_line(body, "CPU a", cpu_alloc_pct, bar_width, color, " alloc")
+        _append_metric_line(body, "MEM a", mem_alloc_pct, bar_width, color, " alloc")
 
     with _lock:
         mig = active_mig
 
     if not hs.vms:
-        grid.add_row(Text(""), Text("[ IDLE ]", style="dim italic"), Text(""))
+        body.append("[ IDLE ]\n", style="dim italic")
     else:
-        shown = hs.vms[:vm_max]
-        for vm in shown:
+        for vm in hs.vms[:vm_max]:
             is_src = mig and mig.vm_name == vm.name and mig.src_host == hs.name
             is_dst = mig and mig.vm_name == vm.name and mig.dst_host == hs.name
-
             if is_src:
-                icon, ic = "⇢", "cyan"
-                label = "migrating"
+                icon, ic, label = ">", "cyan", "migrating"
             elif is_dst:
-                icon, ic = "⇣", "bright_green"
-                label = "arriving "
+                icon, ic, label = "<", "bright_green", "arriving"
             elif vm.state == "running":
-                icon, ic = "●", "green"
-                label = "running  "
+                icon, ic, label = "*", "green", "running"
             else:
-                icon, ic = "○", "dim"
-                label = vm.state[:9]
-
-            vlabel = f"{vm.name[:8]:8} {vm.cpu}c/{vm.mem_mb // 1024}G"
-            grid.add_row(
-                Text(icon, style=ic),
-                Text(vlabel, style="white"),
-                Text(label, style=f"dim {ic}"),
+                icon, ic, label = "-", "dim", vm.state[:8]
+            body.append(
+                f" {icon} {vm.name:<8} {vm.cpu}c {vm.mem_mb // 1024:>2}G  {label}\n",
+                style=ic,
             )
         if len(hs.vms) > vm_max:
-            grid.add_row(Text(""), Text(f"+{len(hs.vms) - vm_max} more", style="dim"), Text(""))
+            body.append(f" +{len(hs.vms) - vm_max} more VM(s)\n", style="dim")
 
     border = "red" if not hs.reachable else color
     return Panel(
-        grid,
+        body,
         title=f"[bold {color}]{hs.name}[/] [dim]{hs.ip}[/dim]",
         border_style=border,
         box=box.ROUNDED,
@@ -745,44 +730,19 @@ def _render_status_panel() -> Panel:
         mb_proc  = mig.data_proc_b  / 1024 / 1024
         mb_total = mig.data_total_b / 1024 / 1024
 
-        bar_w = min(48, (TERM_COLS // 2) - 28)
-        fill  = int(pct / 100 * bar_w)
-        bar   = Text()
-        bar.append("█" * fill,          style="bold blue")
-        bar.append("░" * (bar_w - fill), style="dim")
-        bar.append(f"  {pct:.0f}%",     style="bold cyan")
-
-        arrow = "─" * 16
-        t = Table.grid(padding=(0, 0))
-        t.add_column(width=12)
-        t.add_column()
-        t.add_row(
-            Text("MIGRATING", style="bold cyan"),
-            Text(f"{mig.vm_name}  "
-                 f"{mig.src_host} {arrow}► {mig.dst_host}",
-                 style="bold white")
-        )
-        t.add_row(Text("Progress", style="dim"), bar)
-        t.add_row(
-            Text(""),
-            Text(f"{mb_proc:.1f} / {mb_total:.1f} MB", style="dim"),
-        )
-
-        dirty_c = ("red" if mig.dirty_rate > 2000
-                   else "yellow" if mig.dirty_rate > 500 else "green")
-        stats = Text()
-        stats.append("Dirty rate  ", style="dim")
-        stats.append(f"{mig.dirty_rate:,} pages/s", style=f"bold {dirty_c}")
-        stats.append("    Method  ", style="dim")
-        stats.append("Precopy",     style="white")
-        t.add_row(Text(""), stats)
-
+        bar_w = min(80, TERM_COLS - 40)
+        t = Text()
+        t.append("MIGRATING  ", style="bold cyan")
+        t.append(f"{mig.vm_name}  {mig.src_host} -> {mig.dst_host}\n", style="bold white")
+        t.append("Progress   ", style="dim")
+        t.append_text(_make_bar(pct, bar_w, "blue"))
+        t.append(f" {pct:.0f}%\n", style="bold cyan")
+        t.append(f"           {mb_proc:.1f} / {mb_total:.1f} MB\n", style="dim")
+        dirty_c = "red" if mig.dirty_rate > 2000 else "yellow" if mig.dirty_rate > 500 else "green"
+        t.append("Dirty      ", style="dim")
+        t.append(f"{mig.dirty_rate:,} pages/s  Precopy\n", style=f"bold {dirty_c}")
         if mig.downtime_ms is not None:
-            t.add_row(
-                Text("Downtime", style="dim"),
-                Text(f"{mig.downtime_ms} ms (live)", style="bold green"),
-            )
-
+            t.append(f"Downtime   {mig.downtime_ms} ms\n", style="bold green")
         return Panel(t, title="LIVE MIGRATION", border_style="blue",
                      box=box.ROUNDED, padding=(0, 1))
 
@@ -816,20 +776,14 @@ def _render_status_panel() -> Panel:
         recent = list(mig_history[-3:])
 
     if recent and not mig:
-        hist = Table.grid(padding=(0, 0))
-        hist.add_column(width=10)
-        hist.add_column()
+        hist = Text()
         for j in reversed(recent):
-            line = Text()
-            line.append(f"{j.vm_name} ", style="bold")
-            line.append(f"{j.src_host}→{j.dst_host}  ", style="dim")
-            line.append(f"{j.elapsed:.1f}s", style="cyan")
+            hist.append(f"{j.vm_name} {j.src_host}->{j.dst_host} {j.elapsed:.1f}s", style="bold")
             if j.downtime_ms is not None:
-                line.append(f"  downtime ", style="dim")
-                line.append(f"{j.downtime_ms} ms", style="bold green")
+                hist.append(f"  dt {j.downtime_ms}ms", style="green")
             elif j.failed:
-                line.append("  FAILED", style="bold red")
-            hist.add_row(Text("Last mig", style="dim"), line)
+                hist.append("  FAILED", style="bold red")
+            hist.append("\n")
         return Panel(hist, title="MIGRATION STATS", border_style="dim green",
                      box=box.ROUNDED, padding=(0, 1))
 
@@ -851,24 +805,20 @@ def _render_log_panel() -> Panel:
         "MIG": "bold magenta",
         "BPK": "bold cyan",
     }
-    grid = Table.grid(padding=(0, 0))
-    grid.add_column(width=8, style="dim")
-    grid.add_column(width=4)
-    grid.add_column()
-
+    body = Text()
     with _lock:
         lines = list(log_lines[-LOG_MAX_LINES:])
 
-    msg_w = max(40, (TERM_COLS // 2) - 22)
+    msg_w = TERM_COLS - 22
     for ts, lvl, msg in lines:
         if len(msg) > msg_w:
             msg = msg[: msg_w - 1] + "…"
-        grid.add_row(
-            ts,
-            Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
-            Text(msg),
-        )
-    return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED, padding=(0, 1))
+        body.append(f"{ts} ", style="dim")
+        body.append(f"[{lvl}] ", style=LEVEL_STYLE.get(lvl, "white"))
+        body.append(f"{msg}\n")
+    if not lines:
+        body.append("(no messages yet)\n", style="dim")
+    return Panel(body, title="LOG", border_style="dim", box=box.ROUNDED, padding=(0, 1))
 
 
 def _footer_text() -> Text:
@@ -887,7 +837,7 @@ def _footer_text() -> Text:
 
 
 def _draw_dashboard() -> None:
-    """209×41 — 2 columns via Columns+Group (no Layout slots = no floating gaps)."""
+    """209×41 — single column, each line label+bar+% left-to-right (SSH-safe)."""
     console.clear(home=True)
 
     console.print(Panel(
@@ -901,17 +851,11 @@ def _draw_dashboard() -> None:
         host_states = dict(hosts)
 
     kw = dict(bar_width=HOST_BAR_WIDTH, vm_max=VM_LINES_PER_HOST)
-    left = Group(
-        _render_host_panel(host_states.get(
-            "Host-A", HostState("Host-A", "", 8, 16384, reachable=False)), **kw),
-        _render_host_panel(host_states.get(
-            "Host-B", HostState("Host-B", "", 8, 16384, reachable=False)), **kw),
-        _render_host_panel(host_states.get(
-            "Host-C", HostState("Host-C", "", 8, 16384, reachable=False)), **kw),
-    )
-    right = Group(_render_status_panel(), _render_log_panel())
-
-    console.print(Columns([left, right], equal=True, expand=True))
+    for hname in ("Host-A", "Host-B", "Host-C"):
+        console.print(_render_host_panel(
+            host_states.get(hname, HostState(hname, "", 8, 16384, reachable=False)), **kw))
+    console.print(_render_status_panel())
+    console.print(_render_log_panel())
     console.print(Align.center(_footer_text()))
 
 # ══════════════════════════════════════════════════════════════════════════════

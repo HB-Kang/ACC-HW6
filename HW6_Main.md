@@ -174,7 +174,7 @@ python3 migration_dashboard.py
 
 (`/etc/hw6/cluster.conf` IP 자동 사용)
 
-**SSH 터미널:** **209×41** — 2열 UI (왼쪽 Host A/B/C 세로, 오른쪽 STATUS+LOG). PuTTY 열·행 209×41 권장.
+**SSH 터미널:** **209×41** 권장. 한 열 세로 배치 (Host A→B→C→STATUS→LOG). PuTTY/MobaXterm 호환.
 
 | 키 | 동작 | Case |
 |----|------|------|
