@@ -535,38 +535,65 @@ def run_load_balance():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _do_migrate(vm_name: str, src_host: str, dst_host: str):
+    """Live-migrate vm_name from src_host to dst_host.
+
+    Strategy mirrors hw6_virsh_migrate_live in hw6_config.sh:
+    - If src is Host-A: run  virsh migrate  locally (no remote SSH wrapper).
+    - If src is Host-B/C: SSH into src and run  virsh migrate  there.
+    Either way the migration data channel uses  --migrateuri tcp://<dst_ip>:0
+    (plain TCP, NOT tunnelled), so the SSH session that drives the dashboard
+    is never flooded with VM memory traffic and will not disconnect.
+    --tunnelled --p2p is NOT attempted; it routes GB of RAM through the SSH
+    connection and reliably kills the Xshell session.
+    """
     global active_mig, _mig_start_time
 
-    src_ip = HOSTS_CONFIG[src_host]["ip"]
-    dst_ip = HOSTS_CONFIG[dst_host]["ip"]
+    src_ip   = HOSTS_CONFIG[src_host]["ip"]
+    src_fqdn = HOSTS_CONFIG[src_host]["fqdn"]
+    dst_ip   = HOSTS_CONFIG[dst_host]["ip"]
     dst_fqdn = HOSTS_CONFIG[dst_host]["fqdn"]
+
     dest_uri = f"qemu+ssh://root@{dst_fqdn}/system"
-    mig_tcp = f"tcp://{dst_ip}:0"
-    virsh_base = [
-        "virsh", "-c", f"qemu+ssh://root@{src_ip}/system",
-        "migrate", "--live", "--persistent", "--undefinesource", "--unsafe",
+    mig_tcp  = f"tcp://{dst_ip}:0"
+
+    # virsh flags — must match hw6_virsh_migrate_live
+    mig_flags = [
+        "--live", "--persistent", "--undefinesource", "--unsafe",
+        "--migrateuri", mig_tcp,
     ]
 
     with _lock:
-        active_mig    = MigrationJob(vm_name=vm_name,
-                                     src_host=src_host,
-                                     dst_host=dst_host)
+        active_mig      = MigrationJob(vm_name=vm_name,
+                                       src_host=src_host,
+                                       dst_host=dst_host)
         _mig_start_time = time.time()
 
-    log("MIG", f"{vm_name}: {src_host} → {dst_host} migration started")
+    log("MIG", f"{vm_name}: {src_host} -> {dst_host} migration started")
 
-    # FQDN destination + IP migrateuri; fallback tunnelled+p2p only (other flags → argument unsupported)
-    attempts = [
-        virsh_base + ["--migrateuri", mig_tcp, vm_name, dest_uri],
-        virsh_base + ["--tunnelled", "--p2p", vm_name, dest_uri],
-    ]
-    result = None
-    for i, cmd in enumerate(attempts):
-        if i > 0:
-            log("MIG", f"{vm_name}: retry tunnelled+p2p")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0:
-            break
+    src_short = HOSTS_CONFIG[src_host].get("short", "")
+    is_local_src = (src_short == "servera")
+
+    if is_local_src:
+        # Host-A is the source: run virsh locally — no remote SSH wrapping.
+        cmd = ["virsh", "migrate"] + mig_flags + [vm_name, dest_uri]
+    else:
+        # Host-B or C is the source: SSH there and run virsh locally.
+        # Using  ssh ... virsh migrate  (not virsh -c qemu+ssh://...) so that
+        # the migration data stream goes directly B->C (or C->B) via TCP,
+        # without touching this Python process at all.
+        remote_cmd = (
+            f"virsh migrate --live --persistent --undefinesource --unsafe "
+            f"--migrateuri 'tcp://{dst_ip}:0' "
+            f"'{vm_name}' '{dest_uri}'"
+        )
+        cmd = [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            f"root@{src_fqdn}",
+            remote_cmd,
+        ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
     with _lock:
         mig = active_mig
