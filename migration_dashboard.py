@@ -35,7 +35,7 @@ Usage
 
 Keys: [r] Bin Packing  [c] Consolidate (C Idle)  [l] Load balance  [m] Migrate  [q] Quit
 
-4K / flicker: optional  HW6_DASH_WIDTH=120  HW6_DASH_REFRESH_SEC=1.5  HW6_DASH_ALT_SCREEN=0
+4K flicker: HW6_DASH_WIDTH=120  HW6_DASH_REFRESH_SEC=1.5  (do not set HEIGHT — breaks lines)
 
 Platform
 --------
@@ -94,11 +94,11 @@ HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
 LOG_MAX_LINES    = 6     # max log lines displayed
-# TUI: cap size on 4K terminals (full-width redraws flash); tune with env vars
+# TUI: optional max width (4K); do NOT cap height — squashes rows onto one line
 DASH_MAX_WIDTH   = int(os.environ.get("HW6_DASH_WIDTH", "120"))
-DASH_MAX_HEIGHT  = int(os.environ.get("HW6_DASH_HEIGHT", "44"))
 DASH_REDRAW_SEC  = float(os.environ.get("HW6_DASH_REFRESH_SEC", "1.0"))
 DASH_ALT_SCREEN  = os.environ.get("HW6_DASH_ALT_SCREEN", "1") != "0"
+DASH_MIN_ROWS    = int(os.environ.get("HW6_DASH_MIN_ROWS", "32"))
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -621,13 +621,12 @@ def execute_migrations():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_console() -> Console:
-    """Fixed layout size — avoids 4K-wide full terminal clears that flicker."""
-    tw, th = shutil.get_terminal_size(fallback=(DASH_MAX_WIDTH, DASH_MAX_HEIGHT))
-    return Console(
-        width=min(tw, DASH_MAX_WIDTH),
-        height=min(th, DASH_MAX_HEIGHT),
-        force_terminal=True,
-    )
+    """Cap width only; height must follow the real terminal or lines stack together."""
+    tw, th = shutil.get_terminal_size(fallback=(DASH_MAX_WIDTH, 40))
+    width = tw
+    if DASH_MAX_WIDTH > 0:
+        width = min(tw, DASH_MAX_WIDTH)
+    return Console(width=width, force_terminal=True)
 
 
 console = _make_console()
@@ -884,9 +883,9 @@ def _build_layout() -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="hosts",  size=14),
-        Layout(name="status", size=8),
-        Layout(name="log",    size=10),
+        Layout(name="hosts", ratio=2, minimum_size=14),
+        Layout(name="status", size=10),
+        Layout(name="log", ratio=1, minimum_size=8),
         Layout(name="footer", size=1),
     )
     layout["hosts"].split_row(
@@ -1036,6 +1035,13 @@ def main():
         sys.exit(1)
 
     _init_hosts()
+
+    _tw, _th = shutil.get_terminal_size(fallback=(80, 24))
+    if _th < DASH_MIN_ROWS:
+        console.print(
+            f"[yellow]Warning: terminal height {_th} rows — need ~{DASH_MIN_ROWS}+ "
+            f"(enlarge SSH window / smaller font or zoom)[/yellow]"
+        )
 
     log("OK",  "Dashboard started")
     log("INF", f"libvirt — A:{HOSTS_CONFIG['Host-A']['ip']} "
