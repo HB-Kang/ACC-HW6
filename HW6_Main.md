@@ -29,21 +29,42 @@ B/C는 **A의 `setup_main.sh`가 끝난 뒤** `setup_sub.sh`를 실행합니다.
 1. Rocky Linux 10 **Minimal** 설치  
 2. BIOS에서 CPU 가상화 **ON**  
 3. NIC에 팀이 정한 IP 설정 (스크립트는 NIC IP를 **설정하지 않음**)  
-4. [ACC-HW6](https://github.com/HB-Kang/ACC-HW6) 클론 또는 스크립트 폴더 복사:
+4. 아래 **git 설치 → 클론** (한 번만 하면 됨)  
+5. 이후 명령은 **root**로: `sudo -i` 또는 `sudo bash ...`
 
-```
-setup_main.sh  setup_sub.sh  hw6_config.sh
-create_vms.sh  migration_dashboard.py
+### 1-1. git 설치 + 저장소 받기
+
+Rocky 터미널에서 **위에서 아래로** 그대로 실행:
+
+```bash
+# 1) git 설치
+sudo dnf install -y git
+
+# 2) 잘 설치됐는지 확인
+git --version
+
+# 3) 홈으로 이동 후 클론
+cd ~
+git clone https://github.com/HB-Kang/ACC-HW6.git
+
+# 4) 폴더로 들어가서 파일 확인
+cd ACC-HW6
+ls
 ```
 
-5. root로 작업: `sudo -i` 또는 `sudo bash ...`
+`ls`에 아래 파일이 보이면 OK:
+
+- `setup_main.sh` `setup_sub.sh` `hw6_config.sh`
+- `create_vms.sh` `migration_dashboard.py`
+
+> `hw6_config.sh`는 **따로 실행하지 않습니다.** `setup_main.sh`가 알아서 불러 씁니다.
 
 ---
 
 ## 2. 설치 — `setup_main.sh`
 
 ```bash
-cd /path/to/ACC
+cd ~/ACC-HW6
 sudo bash setup_main.sh
 ```
 

@@ -35,19 +35,44 @@ A가 `setup_main`을 끝내기 전에는 NFS·config가 없어 **B/C 설치가 �
 2. BIOS CPU 가상화 **ON**  
 3. NIC에 **본인 호스트 IP** 설정 (팀 합의 D값)  
 4. A(servera)에 `ping` 되는지 확인  
-5. 스크립트 폴더 복사 (`hw6_config.sh` **필수**)
+5. 아래 **git 설치 → 클론** (한 번만)  
+6. 이후 명령은 **root**: `sudo -i` 또는 `sudo bash ...`
 
 ```bash
 ping -c 2 servera
 # 또는 ping -c 2 192.168.0.10
 ```
 
+### 1-1. git 설치 + 저장소 받기
+
+Rocky 터미널에서 **위에서 아래로** 그대로 실행:
+
+```bash
+# 1) git 설치
+sudo dnf install -y git
+
+# 2) 확인
+git --version
+
+# 3) 클론
+cd ~
+git clone https://github.com/HB-Kang/ACC-HW6.git
+
+# 4) 들어가서 확인 (hw6_config.sh 꼭 있어야 함)
+cd ACC-HW6
+ls
+```
+
+`ls`에 `setup_sub.sh`와 `hw6_config.sh`가 있으면 OK.
+
+> A보다 **먼저** `setup_sub.sh`만 돌리지 마세요. A에서 `setup_main.sh`가 끝난 뒤에 실행합니다.
+
 ---
 
 ## 2. 설치 — `setup_sub.sh`
 
 ```bash
-cd /path/to/ACC
+cd ~/ACC-HW6
 sudo bash setup_sub.sh
 ```
 

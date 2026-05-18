@@ -39,8 +39,16 @@
 - Rocky Linux 10 Minimal, VT-x/AMD-V ON, RAM 8GB+ 권장  
 - **같은 LAN** (물리 스위치 / VBox 브리지)  
 - 주소: **`192.168.0.<D>`** — D값 3개 팀 합의, **NIC에 수동 설정**  
-- 스크립트: [ACC-HW6](https://github.com/HB-Kang/ACC-HW6)  
-- 실행: **root** (`sudo bash ...`)
+- 스크립트 받기 (각 PC에서 한 번):
+
+  ```bash
+  sudo dnf install -y git
+  cd ~ && git clone https://github.com/HB-Kang/ACC-HW6.git && cd ACC-HW6
+  ```
+
+  자세한 단계: A → [HW6_Main.md §1-1](HW6_Main.md#1-1-git-설치--저장소-받기), B/C → [HW6_Sub.md §1-1](HW6_Sub.md#1-1-git-설치--저장소-받기)
+
+- 실행: **root** (`cd ~/ACC-HW6` 후 `sudo bash ...`)
 
 ---
 
