@@ -844,14 +844,12 @@ def _render_status_panel(*, panel_height: Optional[int] = None) -> Panel:
         bar.append("." * (bar_w - fill), style="dim")
         bar.append(f"  {pct:.0f}%",     style="bold cyan")
 
-        arrow = "─" * 16
         t = Table.grid(padding=(0, 1))
         t.add_column(width=12)
         t.add_column()
         t.add_row(
             Text("MIGRATING", style="bold cyan"),
-            Text(f"{mig.vm_name}  "
-                 f"{mig.src_host} {arrow}► {mig.dst_host}",
+            Text(f"{mig.vm_name}  {mig.src_host} -> {mig.dst_host}",
                  style="bold white")
         )
         t.add_row(Text(""), Text(""))
