@@ -35,15 +35,12 @@ Usage
 
 Keys: [r] Bin Packing  [c] Consolidate (C Idle)  [l] Load balance  [m] Migrate  [q] Quit
 
-4K flicker: HW6_DASH_WIDTH=120  HW6_DASH_REFRESH_SEC=1.5  (do not set HEIGHT — breaks lines)
-
 Platform
 --------
   Not supported on native Windows (needs termios/tty + virsh over SSH).
   Run on Host-A, or from Windows: WSL / ssh root@servera 'cd ACC && python3 migration_dashboard.py'
 """
 
-import os
 import shutil
 import subprocess
 import threading
@@ -72,8 +69,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from rich.live import Live
-from rich.layout import Layout
+from rich.columns import Columns
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -93,12 +89,9 @@ HW6_CONFIG_PATHS = (
 HOSTS_CONFIG: Dict[str, dict] = {}
 
 REFRESH_INTERVAL = 1.5   # seconds (background SSH/virsh poll)
-LOG_MAX_LINES    = 6     # max log lines displayed
-# TUI: optional max width (4K); do NOT cap height — squashes rows onto one line
-DASH_MAX_WIDTH   = int(os.environ.get("HW6_DASH_WIDTH", "120"))
-DASH_REDRAW_SEC  = float(os.environ.get("HW6_DASH_REFRESH_SEC", "1.0"))
-DASH_ALT_SCREEN  = os.environ.get("HW6_DASH_ALT_SCREEN", "1") != "0"
-DASH_MIN_ROWS    = int(os.environ.get("HW6_DASH_MIN_ROWS", "32"))
+UI_REFRESH_SEC   = 1.0   # screen redraw (plain SSH terminal)
+LOG_MAX_LINES    = 8     # max log lines displayed
+VM_LINES_PER_HOST = 4    # keep host panels short on 80x24 SSH
 
 HOST_COLORS = {"Host-A": "blue", "Host-B": "magenta", "Host-C": "green"}
 HOST_KEYS   = {"Host-A": "a",   "Host-B": "b",        "Host-C": "c"}
@@ -620,16 +613,8 @@ def execute_migrations():
 #  TUI rendering
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_console() -> Console:
-    """Cap width only; height must follow the real terminal or lines stack together."""
-    tw, th = shutil.get_terminal_size(fallback=(DASH_MAX_WIDTH, 40))
-    width = tw
-    if DASH_MAX_WIDTH > 0:
-        width = min(tw, DASH_MAX_WIDTH)
-    return Console(width=width, force_terminal=True)
-
-
-console = _make_console()
+# Native terminal size — works reliably over SSH (no forced width/height / alt-screen)
+console = Console()
 
 
 def _make_bar(pct: float, width: int = 14, color: str = "blue") -> Text:
@@ -656,9 +641,9 @@ def _render_host_panel(hs: HostState) -> Panel:
     has_host = hs.reachable and (cpu_host > 0 or mem_host > 0 or hs.mem_total_mb > 0)
 
     grid = Table.grid(padding=(0, 1))
-    grid.add_column(width=5)
-    grid.add_column(width=13)
-    grid.add_column(width=11, justify="right")
+    grid.add_column(width=4)
+    grid.add_column(width=12)
+    grid.add_column(width=9, justify="right")
 
     def pct_style(pct: float, base: str) -> str:
         return f"bold {'red' if pct >= 90 else ('yellow' if pct >= 70 else base)}"
@@ -709,7 +694,8 @@ def _render_host_panel(hs: HostState) -> Panel:
             Text("")
         )
     else:
-        for vm in hs.vms:
+        shown = hs.vms[:VM_LINES_PER_HOST]
+        for vm in shown:
             is_src = mig and mig.vm_name == vm.name and mig.src_host == hs.name
             is_dst = mig and mig.vm_name == vm.name and mig.dst_host == hs.name
 
@@ -728,10 +714,12 @@ def _render_host_panel(hs: HostState) -> Panel:
 
             grid.add_row(
                 Text(icon, style=ic),
-                Text(f"{vm.name}  {vm.cpu}c/{vm.mem_mb // 1024}G",
-                     style="white"),
-                Text(label, style=f"dim {ic}")
+                Text(f"{vm.name} {vm.cpu}c/{vm.mem_mb // 1024}G", style="white"),
+                Text(label, style=f"dim {ic}"),
             )
+        if len(hs.vms) > VM_LINES_PER_HOST:
+            extra = len(hs.vms) - VM_LINES_PER_HOST
+            grid.add_row(Text(""), Text(f"+{extra} more", style="dim"), Text(""))
 
     border = "red" if not hs.reachable else color
     return Panel(
@@ -874,65 +862,52 @@ def _render_log_panel() -> Panel:
             Text(f"[{lvl}]", style=LEVEL_STYLE.get(lvl, "white")),
             Text(msg)
         )
-    grid.add_row("", "", Text("▌", style="dim"))
-
     return Panel(grid, title="LOG", border_style="dim", box=box.ROUNDED)
 
 
-def _build_layout() -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="hosts", ratio=2, minimum_size=14),
-        Layout(name="status", size=10),
-        Layout(name="log", ratio=1, minimum_size=8),
-        Layout(name="footer", size=1),
-    )
-    layout["hosts"].split_row(
-        Layout(name="host_a"),
-        Layout(name="host_b"),
-        Layout(name="host_c"),
-    )
-    return layout
+def _footer_text() -> Text:
+    footer = Text(justify="center")
+    for key, desc in (
+        ("[r]", "BinPack"),
+        ("[c]", "Consolidate"),
+        ("[l]", "LoadBal"),
+        ("[m]", "Migrate"),
+        ("[q]", "Quit"),
+    ):
+        footer.append(key, style="bold yellow")
+        footer.append(f" {desc}  ", style="dim")
+    footer.append(time.strftime("%H:%M:%S"), style="dim")
+    return footer
 
 
-def _render(layout: Layout):
-    # Header
-    layout["header"].update(Panel(
-        Align.center(Text(
-            "⚡  LIVE MIGRATION DASHBOARD  ·  HW6  ·  2D Bin Packing",
-            style="bold cyan"
-        )),
-        border_style="dim blue", box=box.HEAVY_HEAD
+def _draw_dashboard() -> None:
+    """Full-screen redraw for normal SSH terminals (one section per line)."""
+    console.clear(home=True)
+
+    console.print(Panel(
+        Align.center(Text("HW6 Live Migration Dashboard", style="bold cyan")),
+        box=box.HEAVY_HEAD,
+        border_style="blue",
     ))
 
-    # Hosts
     with _lock:
         host_states = dict(hosts)
 
-    layout["host_a"].update(_render_host_panel(
-        host_states.get("Host-A", HostState("Host-A", "", 8, 16384, reachable=False))))
-    layout["host_b"].update(_render_host_panel(
-        host_states.get("Host-B", HostState("Host-B", "", 8, 16384, reachable=False))))
-    layout["host_c"].update(_render_host_panel(
-        host_states.get("Host-C", HostState("Host-C", "", 8, 16384, reachable=False))))
-
-    # Status
-    layout["status"].update(_render_status_panel())
-
-    # Log
-    layout["log"].update(_render_log_panel())
-
-    # Footer
-    footer = Text(justify="center")
-    pairs = [("[r]", "Spread BinPack"), ("[c]", "Consolidate (C idle)"),
-             ("[l]", "Load balance"),  ("[m]", "Run migration"),
-             ("[q]", "Quit")]
-    for key, desc in pairs:
-        footer.append(key,  style="bold yellow")
-        footer.append(f" {desc}  ", style="dim")
-    footer.append(time.strftime("%H:%M:%S"), style="dim")
-    layout["footer"].update(Align.center(footer))
+    console.print(Columns(
+        [
+            _render_host_panel(host_states.get(
+                "Host-A", HostState("Host-A", "", 8, 16384, reachable=False))),
+            _render_host_panel(host_states.get(
+                "Host-B", HostState("Host-B", "", 8, 16384, reachable=False))),
+            _render_host_panel(host_states.get(
+                "Host-C", HostState("Host-C", "", 8, 16384, reachable=False))),
+        ],
+        expand=True,
+        equal=True,
+    ))
+    console.print(_render_status_panel())
+    console.print(_render_log_panel())
+    console.print(Align.center(_footer_text()))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Key handling
@@ -1036,11 +1011,10 @@ def main():
 
     _init_hosts()
 
-    _tw, _th = shutil.get_terminal_size(fallback=(80, 24))
-    if _th < DASH_MIN_ROWS:
+    tw, th = shutil.get_terminal_size(fallback=(100, 30))
+    if tw < 100 or th < 28:
         console.print(
-            f"[yellow]Warning: terminal height {_th} rows — need ~{DASH_MIN_ROWS}+ "
-            f"(enlarge SSH window / smaller font or zoom)[/yellow]"
+            f"[yellow]Tip: terminal {tw}x{th} — enlarge SSH window (~100x30+ recommended)[/yellow]"
         )
 
     log("OK",  "Dashboard started")
@@ -1052,34 +1026,22 @@ def main():
     upd = threading.Thread(target=_update_loop, daemon=True)
     upd.start()
 
-    layout = _build_layout()
-
-    # Terminal raw mode (immediate key input)
+  # Raw mode for single-key input; plain clear+print each second (SSH-safe)
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
-        with Live(
-            layout,
-            console=console,
-            screen=DASH_ALT_SCREEN,
-            transient=True,
-            auto_refresh=False,
-            refresh_per_second=4,
-        ) as live:
-            while running:
-                _render(layout)
-                live.refresh()
-
-                if select.select([sys.stdin], [], [], DASH_REDRAW_SEC)[0]:
-                    key = sys.stdin.read(1)
-                    if key in ("q", "\x03"):   # q or Ctrl+C
-                        running = False
-                        break
-                    _handle_key(key)
-
+        while running:
+            _draw_dashboard()
+            if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
+                key = sys.stdin.read(1)
+                if key in ("q", "\x03"):   # q or Ctrl+C
+                    running = False
+                    break
+                _handle_key(key)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        console.print("\n[dim]Dashboard exited.[/dim]")
+        console.clear(home=True)
+        console.print("[dim]Dashboard exited.[/dim]")
 
 
 if __name__ == "__main__":

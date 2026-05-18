@@ -174,14 +174,7 @@ python3 migration_dashboard.py
 
 (`/etc/hw6/cluster.conf` IP 자동 사용)
 
-**4K·깜빡임:** 폭만 제한 (기본 120칸). **높이는 터미널 창에 맡기세요** — `HEIGHT` 를 고정하면 여러 줄이 한 줄에 겹쳐 보입니다.
-
-```bash
-export HW6_DASH_WIDTH=120 HW6_DASH_REFRESH_SEC=1.5
-python3 migration_dashboard.py
-```
-
-한 줄에 여러 줄이 붙어 보이면: SSH 터미널 **세로 크기 키우기** (최소 ~32줄) 또는 글꼴/줌 줄이기.
+**SSH 터미널:** 일반 clear+출력 방식 (PuTTY, Windows Terminal, `ssh` 모두 호환). 창 크기 **가로 100 · 세로 30** 이상 권장.
 
 | 키 | 동작 | Case |
 |----|------|------|
