@@ -186,7 +186,13 @@ class HostState:
 #  Global state
 # ══════════════════════════════════════════════════════════════════════════════
 
-_lock            = threading.Lock()
+_lock            = threading.RLock()   # reentrant: protects against accidental
+                                       # re-acquire inside helpers like log()
+                                       # that themselves take _lock. With a
+                                       # plain Lock(), `with _lock: log(...)`
+                                       # would self-deadlock the thread, and
+                                       # every other thread that later tries
+                                       # to take _lock would freeze with it.
 hosts:           Dict[str, HostState] = {}
 active_mig:      Optional[MigrationJob] = None
 mig_history:     List[MigrationJob] = []
@@ -478,7 +484,6 @@ def _update_loop():
                 # Reset throttle so the next migration starts fresh.
                 next_mig_poll = 0.0
                 # ── NORMAL POLLING ───────────────────────────────────────────
-                # ── NORMAL POLLING ───────────────────────────────────────────
                 for h_name, h_conf in HOSTS_CONFIG.items():
                     ip = h_conf["ip"]
                     vms, ok = fetch_host_vms(h_name, ip)
@@ -721,9 +726,17 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
                 active_mig.failed = True
                 active_mig.error_msg = err_detail[:80]
                 active_mig.elapsed = time.time() - _mig_start_time
-                log("ERR", f"{vm_name} failed (rc={result.returncode}) — check LOG above")
                 mig_history.append(active_mig)
                 active_mig = None
+                _failed_now = True
+            else:
+                _failed_now = False
+        # NB: log() outside the lock — never call log() while holding _lock,
+        # log() itself acquires _lock. With the new RLock this no longer
+        # deadlocks, but keeping log() out of locked regions also avoids
+        # holding the lock longer than necessary.
+        if _failed_now:
+            log("ERR", f"{vm_name} failed (rc={result.returncode}) — check LOG above")
 
 
 def execute_migrations():
