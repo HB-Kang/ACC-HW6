@@ -108,6 +108,34 @@ HOST_BAR_WIDTH = 60     # default; overridden each frame from actual panel width
 # Set to 0 to disable the cap entirely.
 MIG_BANDWIDTH_MIBPS = 100
 
+# ── Monitoring / SSH throttle during live migration ─────────────────────────
+# Diagnostic flags for the "SSH dies 1-2s into migration" symptom.
+# Hypothesis: the background _update_loop's fetch_domjobinfo SSH calls (and the
+# full-screen redraw pushed to the controller SSH) contend with the migration's
+# own SSH/TCP channels, so the controller's Xshell session is dropped.
+#
+# Knobs (lower = less interference, but staler dashboard during migration):
+#   MIG_MONITOR_ENABLED   False → fetch_domjobinfo is COMPLETELY skipped while
+#                                 a migration is active. The dashboard still
+#                                 records start/finalize (elapsed + downtime
+#                                 via domjobinfo --completed AFTER the migrate
+#                                 subprocess returns), so you still get the
+#                                 summary — just no live progress bar.
+#   MIG_POLL_INTERVAL     seconds between domjobinfo polls during migration
+#                         (decoupled from the faster REFRESH_INTERVAL used for
+#                         normal idle polling).
+#   MIG_POLL_GRACE_SEC    skip ALL background SSH for the first N seconds
+#                         after migration starts — protects the TCP setup
+#                         burst from extra ControlMaster traffic.
+#   RENDER_INTERVAL_MIG   frame interval pushed to the controller SSH while
+#                         migration is running (default UI_REFRESH_SEC = 1.0
+#                         feels snappy but multiplies the outbound SSH bytes
+#                         that share the saturated NIC).
+MIG_MONITOR_ENABLED  = True
+MIG_POLL_INTERVAL    = 5.0
+MIG_POLL_GRACE_SEC   = 3.0
+RENDER_INTERVAL_MIG  = 3.0
+
 # Filled in main() from actual terminal size
 _ui: Dict[str, int] = {}
 
@@ -414,6 +442,7 @@ def _finalize_migration(mig: MigrationJob, src_ip: str) -> bool:
 
 def _update_loop():
     global active_mig  # noqa: PLW0603
+    next_mig_poll = 0.0
     while running:
         try:
             with _lock:
@@ -424,18 +453,31 @@ def _update_loop():
                 # ── MIGRATION IN PROGRESS ────────────────────────────────────
                 # Skip the expensive full host poll (3× virsh list + dominfo +
                 # ssh_script per host) that hammers SSH during migration.
-                # Only fetch domjobinfo to drive the LIVE MIGRATION panel.
-                assert mig is not None
-                src_ip = HOSTS_CONFIG[mig.src_host]["ip"]
-                job = fetch_domjobinfo(src_ip, mig.vm_name)
-                with _lock:
-                    if job and active_mig:
-                        _apply_domjob_to_mig(active_mig, job)
-                    elif active_mig and not active_mig.completed:
-                        # No active job on source: migration may have completed;
-                        # _do_migrate thread will finalize when subprocess returns.
-                        pass
+                # Only fetch domjobinfo to drive the LIVE MIGRATION panel —
+                # and even that is throttled / can be fully disabled, since the
+                # extra SSH chatter is the prime suspect for controller-side
+                # session drops during the first seconds of migration.
+                now = time.time()
+                in_grace = now < (_mig_start_time + MIG_POLL_GRACE_SEC)
+                if (MIG_MONITOR_ENABLED
+                        and not in_grace
+                        and now >= next_mig_poll):
+                    next_mig_poll = now + MIG_POLL_INTERVAL
+                    assert mig is not None
+                    src_ip = HOSTS_CONFIG[mig.src_host]["ip"]
+                    job = fetch_domjobinfo(src_ip, mig.vm_name)
+                    with _lock:
+                        if job and active_mig:
+                            _apply_domjob_to_mig(active_mig, job)
+                        elif active_mig and not active_mig.completed:
+                            # No active job on source: migration may have completed;
+                            # _do_migrate thread will finalize when subprocess returns.
+                            pass
+                # else: monitoring disabled / in grace / not yet due — sleep only
             else:
+                # Reset throttle so the next migration starts fresh.
+                next_mig_poll = 0.0
+                # ── NORMAL POLLING ───────────────────────────────────────────
                 # ── NORMAL POLLING ───────────────────────────────────────────
                 for h_name, h_conf in HOSTS_CONFIG.items():
                     ip = h_conf["ip"]
@@ -1422,6 +1464,9 @@ def main():
     log("INF", f"libvirt — A:{HOSTS_CONFIG['Host-A']['ip']} "
               f"B:{HOSTS_CONFIG['Host-B']['ip']} "
               f"C:{HOSTS_CONFIG['Host-C']['ip']}")
+    log("INF", f"mig-mon enabled={MIG_MONITOR_ENABLED} "
+              f"poll={MIG_POLL_INTERVAL:.1f}s grace={MIG_POLL_GRACE_SEC:.1f}s "
+              f"render={RENDER_INTERVAL_MIG:.1f}s  bw={MIG_BANDWIDTH_MIBPS}MiB/s")
 
     # Background update thread
     upd = threading.Thread(target=_update_loop, daemon=True)
@@ -1431,24 +1476,39 @@ def main():
     draw_h = sizes["total"]
     old_settings = termios.tcgetattr(sys.stdin)
     _crash_log = Path("/tmp/hw6dash_crash.log")
+    last_render = 0.0
+    KEY_POLL_SEC = 0.2   # responsive keys even when render is throttled
     try:
         tty.setraw(sys.stdin.fileno())
         # ?25l: hide cursor | ?7l: disable auto-wrap | 2J: clear once | H: home
         sys.stdout.write("\033[?25l\033[?7l\033[2J\033[H")
         sys.stdout.flush()
         while running:
-            try:
-                _render(layout, sizes)
-                _present(layout, safe_w, draw_h)
-            except Exception as _exc:  # noqa: BLE001
-                # Never let a render exception kill the session; log and continue.
-                log("ERR", f"render: {_exc}")
+            now = time.time()
+            # During a live migration we throttle full-screen redraws: every
+            # frame pushes ~6 KB of ANSI to the controller SSH, and that shares
+            # the same NIC the migration is saturating. Slower redraw = fewer
+            # bytes competing with the migration's outgoing traffic.
+            with _lock:
+                _mig_busy = (active_mig is not None
+                             and not active_mig.completed
+                             and not active_mig.failed)
+            frame_interval = RENDER_INTERVAL_MIG if _mig_busy else UI_REFRESH_SEC
+            if now - last_render >= frame_interval:
                 try:
-                    import traceback as _tb
-                    _crash_log.write_text(_tb.format_exc())
-                except Exception:
-                    pass
-            if select.select([sys.stdin], [], [], UI_REFRESH_SEC)[0]:
+                    _render(layout, sizes)
+                    _present(layout, safe_w, draw_h)
+                except Exception as _exc:  # noqa: BLE001
+                    # Never let a render exception kill the session; log and continue.
+                    log("ERR", f"render: {_exc}")
+                    try:
+                        import traceback as _tb
+                        _crash_log.write_text(_tb.format_exc())
+                    except Exception:
+                        pass
+                last_render = now
+            # Keys are always polled quickly so [q] / preset / migrate stays snappy.
+            if select.select([sys.stdin], [], [], KEY_POLL_SEC)[0]:
                 key = sys.stdin.read(1)
                 if key in ("q", "\x03"):
                     running = False
