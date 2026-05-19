@@ -138,10 +138,17 @@ for vm in "${VM_NAMES[@]}"; do
     # Disk from base image backing (qcow2 on NFS only)
     rm -f "$disk_path"
     qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMG" "$disk_path" 20G -q
+    # NFS doesn't support xattrs → libvirt's dynamic_ownership/remember_owner
+    # is unreliable on shared storage. We run with dynamic_ownership=0 and
+    # chown disks ourselves so they stay qemu:qemu across migrations.
+    chown qemu:qemu "$disk_path"
+    chmod 660 "$disk_path"
     ok "Disk created: $disk_path (20G, backing: jammy-base)"
 
     # cloud-init ISO
     iso_path=$(make_cloud_init_iso "$vm")
+    chown qemu:qemu "$iso_path" 2>/dev/null || true
+    chmod 644 "$iso_path" 2>/dev/null || true
     ok "cloud-init ISO created: $iso_path"
 
     # Create VM

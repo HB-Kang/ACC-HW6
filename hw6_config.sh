@@ -823,12 +823,22 @@ hw6_ssh_update_known_hosts() {
     mkdir -p "$HW6_CONFIG_DIR"
     : > "$HW6_SSH_KNOWN_HOSTS"
 
-    ssh-keyscan -H servera serverb serverc \
+    # libvirt qemu+ssh URIs use FQDNs (servera.${HW6_HOST_DOMAIN}), so the
+    # FQDN host keys MUST be in this file too — otherwise migrations from
+    # B/C fail at completion with "Permission denied" because the inner
+    # SSH (BatchMode) can't verify the destination host key.
+    ssh-keyscan -t rsa,ecdsa,ed25519 \
+        servera serverb serverc \
+        "servera.${HW6_HOST_DOMAIN}" \
+        "serverb.${HW6_HOST_DOMAIN}" \
+        "serverc.${HW6_HOST_DOMAIN}" \
         "$HOST_A_IP" "$HOST_B_IP" "$HOST_C_IP" 2>/dev/null \
         >> "$HW6_SSH_KNOWN_HOSTS" || true
 
+    # dedup
+    sort -u "$HW6_SSH_KNOWN_HOSTS" -o "$HW6_SSH_KNOWN_HOSTS"
     chmod 644 "$HW6_SSH_KNOWN_HOSTS"
-    ok_cb "ssh_known_hosts updated"
+    ok_cb "ssh_known_hosts updated (short + FQDN + IP)"
 }
 
 hw6_ssh_wait_for_port() {

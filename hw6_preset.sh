@@ -156,9 +156,17 @@ create_vm_local() {
 
     rm -f "$disk"
     qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMG}" "$disk" 20G -q
+    # NFS doesn't support xattrs, so libvirt's dynamic_ownership/remember_owner
+    # silently fails and falls back to root:root at VM stop / migrate-out,
+    # breaking subsequent migrations. We run with dynamic_ownership=0 and
+    # chown the disk to qemu:qemu ourselves up-front.
+    chown qemu:qemu "$disk"
+    chmod 660 "$disk"
 
     local iso
     iso=$(make_cloud_init_iso "$vm") || return 1
+    chown qemu:qemu "$iso" 2>/dev/null || true
+    chmod 644 "$iso" 2>/dev/null || true
 
     virt-install \
         --name "$vm" \
