@@ -609,32 +609,15 @@ def run_bin_packing(consolidate: bool = False):
 
 def run_load_balance():
     """
-    Case 3: detect overloaded hosts → spread load evenly
-    Move VMs from hosts with CPU usage > 80% to hosts with spare capacity.
+    Case 3: redistribute VMs across all hosts.
+
+    Demo-only — the original implementation required real CPU usage
+    ≥80% on some host (via cpu_host_pct or vCPU oversubscription).
+    For presentation purposes we skip the threshold check and always
+    run the spread algorithm, so the audience sees migration happen
+    without us having to run stress-ng inside the guests.
     """
-    global bin_pack_plan
-
-    with _lock:
-        snapshot = {
-            n: (list(hs.vms), hs.cpu_cap, hs.mem_cap_mb, hs.cpu_host_pct)
-            for n, hs in hosts.items()
-        }
-
-    overloaded = []
-    for h_name, (vms, cpu_cap, _, cpu_host_pct) in snapshot.items():
-        if cpu_host_pct > 0:
-            cpu_load = cpu_host_pct / 100.0
-        else:
-            used_cpu = sum(v.cpu for v in vms if v.state == "running")
-            cpu_load = used_cpu / cpu_cap if cpu_cap else 0
-        if cpu_load >= 0.80:
-            overloaded.append(h_name)
-
-    if not overloaded:
-        log("WRN", "No overloaded hosts (CPU < 80%)")
-        return
-
-    log("BPK", f"Overloaded hosts: {', '.join(overloaded)}")
+    log("BPK", "LoadBal: redistributing VMs across all hosts (threshold skipped)")
     run_bin_packing(consolidate=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
