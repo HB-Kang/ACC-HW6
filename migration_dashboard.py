@@ -715,11 +715,29 @@ def _do_migrate(vm_name: str, src_host: str, dst_host: str):
                     active_mig = None
     else:
         err_detail = (result.stderr or result.stdout or "").strip()
-        # Log first meaningful non-empty line so the user can diagnose
+        # Dump the FULL stderr+stdout to disk — LOG panel truncates lines,
+        # and the actual migration error is usually on the 2nd or 3rd line
+        # (after "Message from the source"). Path is fixed so the user can
+        # tail it: tail -f /tmp/hw6dash_migrate.log
+        try:
+            with open("/tmp/hw6dash_migrate.log", "a") as _f:
+                _f.write(
+                    f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"{vm_name} {src_host}->{dst_host} rc={result.returncode} =====\n"
+                )
+                _f.write(err_detail or "<no output>")
+                _f.write("\n")
+        except OSError:
+            pass
+        # Log up to first 5 meaningful lines to LOG panel (wider truncation too)
+        _logged = 0
         for _ln in err_detail.splitlines():
             _ln = _ln.strip()
-            if _ln:
-                log("ERR", f"{vm_name} virsh: {_ln[:120]}")
+            if not _ln:
+                continue
+            log("ERR", f"{vm_name} virsh: {_ln[:200]}")
+            _logged += 1
+            if _logged >= 5:
                 break
         with _lock:
             if active_mig:
